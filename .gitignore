@@ -1,3 +1,4 @@
+.env
 settings.py
 models.py
 /uploads

@@ -1,15 +1,33 @@
+import os
 from logging.config import fileConfig
-from sqlalchemy import engine_from_config, pool
-from sqlalchemy import MetaData
+from sqlalchemy import create_engine, pool
 from alembic import context
+from dotenv import load_dotenv
 
-# Import model base
+# Load .env
+load_dotenv()
+
+# --- DATABASE CONFIG FROM .ENV ---
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASS = os.getenv("DB_PASS", "")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "3306")
+DB_NAME = os.getenv("DB_NAME", "dokumi")
+
+DATABASE_URL = f"mysql+mysqlconnector://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+# Alembic Config
+config = context.config
+fileConfig(config.config_file_name)
+
+# ------------------------------------
+#   DEFINE SQLALCHEMY MODELS
+# ------------------------------------
+
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, JSON, ForeignKey
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
-
-# ---- MODEL DEFINITIONS ----
 
 class Documents(Base):
     __tablename__ = "documents"
@@ -59,18 +77,19 @@ class CompressedFiles(Base):
     updated_at = Column(DateTime)
 
 
-# ---- END MODEL DEFINITIONS ----
-
-config = context.config
-fileConfig(config.config_file_name)
-
+# TARGET METADATA FOR MIGRATIONS
 target_metadata = Base.metadata
 
+# ------------------------------------
+#        MIGRATION FUNCTIONS
+# ------------------------------------
 
 def run_migrations_offline():
-    url = config.get_main_option("sqlalchemy.url")
+    """
+    Run migrations in 'offline' mode.
+    """
     context.configure(
-        url=url,
+        url=DATABASE_URL,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -81,16 +100,15 @@ def run_migrations_offline():
 
 
 def run_migrations_online():
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    """
+    Run migrations in 'online' mode.
+    """
+    connectable = create_engine(DATABASE_URL, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         context.configure(
             connection=connection,
-            target_metadata=target_metadata
+            target_metadata=target_metadata,
         )
 
         with context.begin_transaction():
@@ -101,4 +119,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

@@ -7,3 +7,4 @@ Pillow==10.1.0
 Werkzeug==3.0.1
 pycryptodome==3.23.0
 pydantic_settings
+alembic==1.17.2
