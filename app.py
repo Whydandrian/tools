@@ -29,17 +29,26 @@ CORS(app, resources={
 UPLOAD_FOLDER = 'uploads'
 OUTPUT_OCR_FOLDER = 'ocr_results'
 COMPRESSED_FOLDER = 'compressed'
+CONVERTED_FOLDER = 'converted'
+SPLIT_FOLDER = 'splitted'
+MERGED_FOLDER = 'merged'
 ALLOWED_EXTENSIONS = {'pdf'}
 
 # Buat folder jika belum ada
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(COMPRESSED_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_OCR_FOLDER, exist_ok=True)
+os.makedirs(CONVERTED_FOLDER, exist_ok=True)
+os.makedirs(SPLIT_FOLDER, exist_ok=True)
+os.makedirs(MERGED_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['COMPRESSED_FOLDER'] = COMPRESSED_FOLDER
 app.config['OUTPUT_OCR_FOLDER'] = OUTPUT_OCR_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Max 16MB
+app.config['CONVERTED_FOLDER'] = CONVERTED_FOLDER
+app.config['SPLIT_FOLDER'] = SPLIT_FOLDER
+app.config['MERGED_FOLDER'] = MERGED_FOLDER
 
 # ==================== DATABASE CONFIGURATION ====================
 # Konfigurasi untuk DBngin (Mac)
@@ -443,6 +452,154 @@ def compress_with_gs(input_path, output_path, quality="screen"):
 
     if process.returncode != 0:
         raise Exception(f"Ghostscript error: {process.stderr.decode()}")
+
+
+def create_convert_entry(document_id):
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="dokumi"
+    )
+    cursor = conn.cursor()
+
+    uuid_str = uuid.uuid4().hex
+    now = datetime.now()
+
+    sql = """
+        INSERT INTO convert_files (uuid, document_id, status, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s)
+    """
+
+    cursor.execute(sql, (uuid_str, document_id, "processing", now, now))
+    conn.commit()
+
+    convert_id = cursor.lastrowid
+    cursor.close()
+    conn.close()
+    return convert_id, uuid_str
+
+
+def update_convert_status(convert_id, status, converted_path=None, converted_file_name=None):
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="dokumi"
+    )
+    cursor = conn.cursor()
+
+    sql = """
+        UPDATE convert_files 
+        SET status=%s, converted_path=%s, converted_file_name=%s, updated_at=%s
+        WHERE id=%s
+    """
+
+    now = datetime.now()
+    cursor.execute(sql, (status, converted_path, converted_file_name, now, convert_id))
+    conn.commit()
+
+    cursor.close()
+    conn.close()
+
+
+def create_merge_entry(document_ids):
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="dokumi"
+    )
+    cursor = conn.cursor()
+
+    now = datetime.now()
+    document_ids_json = json.dumps(document_ids)
+
+    sql = """
+        INSERT INTO merge_files (document_id, status, created_at, updated_at)
+        VALUES (%s, %s, %s, %s)
+    """
+
+    cursor.execute(sql, (document_ids_json, "processing", now, now))
+    conn.commit()
+
+    merge_id = cursor.lastrowid
+    cursor.close()
+    conn.close()
+    return merge_id
+
+
+def update_merge_status(merge_id, status, merged_path=None, merged_file_name=None, merged_size=None):
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="dokumi"
+    )
+    cursor = conn.cursor()
+
+    sql = """
+        UPDATE merge_files 
+        SET status=%s, merged_path=%s, merged_file_name=%s, merged_size=%s, updated_at=%s
+        WHERE id=%s
+    """
+
+    now = datetime.now()
+    cursor.execute(sql, (status, merged_path, merged_file_name, merged_size, now, merge_id))
+    conn.commit()
+
+    cursor.close()
+    conn.close()
+
+
+def create_split_entry(document_id):
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="dokumi"
+    )
+    cursor = conn.cursor()
+
+    uuid_str = uuid.uuid4().hex
+    now = datetime.now()
+
+    sql = """
+        INSERT INTO split_files (uuid, document_id, status, created_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s)
+    """
+
+    cursor.execute(sql, (uuid_str, document_id, "processing", now, now))
+    conn.commit()
+
+    split_id = cursor.lastrowid
+    cursor.close()
+    conn.close()
+    return split_id, uuid_str
+
+
+def update_split_status(split_id, status, splited_path=None, splited_file_name=None, splited_size=None):
+    conn = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="",
+        database="dokumi"
+    )
+    cursor = conn.cursor()
+
+    sql = """
+        UPDATE split_files 
+        SET status=%s, splited_path=%s, splited_file_name=%s, splited_size=%s, updated_at=%s
+        WHERE id=%s
+    """
+
+    now = datetime.now()
+    cursor.execute(sql, (status, splited_path, splited_file_name, splited_size, now, split_id))
+    conn.commit()
+
+    cursor.close()
+    conn.close()
+
 
 # ==================== OCR ENDPOINT ====================
 @app.route('/docs/api/tools/ocr', methods=['POST'])
@@ -880,7 +1037,10 @@ curl http://localhost:5000/docs/api/tools/compress/list</code></pre>
 def download_file(folder, filename):
     base_path = {
         "ocr": app.config['OUTPUT_OCR_FOLDER'],
-        "compressed": app.config['COMPRESSED_FOLDER']
+        "compressed": app.config['COMPRESSED_FOLDER'],
+        "converted": app.config['CONVERTED_FOLDER'],
+        "splitted": app.config['SPLIT_FOLDER'],
+        "merged": app.config['MERGED_FOLDER'],
     }.get(folder)
 
     if not base_path:
@@ -893,6 +1053,497 @@ def download_file(folder, filename):
 
     return send_file(file_path, as_attachment=True)
 
+# ==================== NEW ENDPOINTS ====================
+
+@app.route('/docs/api/tools/convert-ppt-to-pdf', methods=['POST'])
+def convert_ppt_to_pdf():
+    """
+    Endpoint untuk convert PPT/PPTX to PDF
+    """
+    convert_id = None  # Initialize to avoid NameError
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'Tidak ada file yang diupload', 'status': 'failed'}), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({'error': 'Tidak ada file yang dipilih', 'status': 'failed'}), 400
+
+        # Get file extension
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        
+        # Check file extension - support both .ppt and .pptx
+        if file_extension not in ['.ppt', '.pptx']:
+            return jsonify({'error': 'File harus berformat PPT atau PPTX', 'status': 'failed'}), 400
+
+        original_filename = secure_filename(file.filename)
+        file_id = f"ppt_{uuid.uuid4().hex}_{original_filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        file.save(file_path)
+
+        file_size = os.path.getsize(file_path)
+
+        document_id = create_documents_entry(
+            original_filename,
+            file_path,
+            file_extension,  # Will be .ppt or .pptx
+            file_size,
+            0  # PPT/PPTX doesn't have page count like PDF
+        )
+        convert_id, convert_uuid = create_convert_entry(document_id)
+        
+        # Convert using LibreOffice command (works for both .ppt and .pptx)
+        cmd = [
+            'soffice',
+            '--headless',
+            '--convert-to',
+            'pdf',
+            '--outdir',
+            app.config['CONVERTED_FOLDER'],
+            file_path
+        ]
+        
+        # Add timeout to prevent hanging (120 seconds for large presentations)
+        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        
+        if process.returncode != 0:
+            raise Exception(f"LibreOffice conversion error: {process.stderr.decode()}")
+        
+        # Get output PDF path
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        output_pdf = os.path.join(app.config['CONVERTED_FOLDER'], f"{base_name}.pdf")
+        
+        # Check if conversion succeeded
+        if not os.path.exists(output_pdf):
+            raise Exception("Conversion failed: PDF file not created")
+        
+        pdf_filename = os.path.basename(output_pdf)
+        update_convert_status(convert_id, "completed", output_pdf, pdf_filename)
+
+        return jsonify({
+            "status": "success",
+            "message": f"{file_extension.upper()} to PDF conversion completed",
+            "file_id": file_id,
+            "document_id": document_id,
+            "convert_id": convert_id,
+            "original_filename": original_filename,
+            "original_format": file_extension,
+            "converted_filename": pdf_filename,
+            "download_url": f"/download/converted/{pdf_filename}"
+        })
+
+    except subprocess.TimeoutExpired:
+        if convert_id:
+            update_convert_status(convert_id, "failed")
+        return jsonify({'error': 'Conversion timeout: File terlalu besar atau kompleks', 'status': 'failed'}), 500
+    except Exception as e:
+        if convert_id:
+            update_convert_status(convert_id, "failed")
+        return jsonify({'error': str(e), 'status': 'failed'}), 500
+
+@app.route('/docs/api/tools/convert-doc-to-pdf', methods=['POST'])
+def convert_doc_to_pdf():
+    """
+    Endpoint untuk convert DOC/DOCX to PDF
+    """
+    convert_id = None  # Initialize to avoid NameError
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'Tidak ada file yang diupload', 'status': 'failed'}), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({'error': 'Tidak ada file yang dipilih', 'status': 'failed'}), 400
+
+        # Get file extension
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        
+        # Check file extension - support both .doc and .docx
+        if file_extension not in ['.doc', '.docx']:
+            return jsonify({'error': 'File harus berformat DOC atau DOCX', 'status': 'failed'}), 400
+
+        original_filename = secure_filename(file.filename)
+        file_id = f"doc_{uuid.uuid4().hex}_{original_filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        file.save(file_path)
+
+        file_size = os.path.getsize(file_path)
+
+        document_id = create_documents_entry(
+            original_filename,
+            file_path,
+            file_extension,  # Will be .doc or .docx
+            file_size,
+            0  # DOC/DOCX doesn't have page count like PDF
+        )
+        convert_id, convert_uuid = create_convert_entry(document_id)
+        
+        # Convert using LibreOffice command (works for both .doc and .docx)
+        cmd = [
+            'soffice',
+            '--headless',
+            '--convert-to',
+            'pdf',
+            '--outdir',
+            app.config['CONVERTED_FOLDER'],
+            file_path
+        ]
+        
+        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        if process.returncode != 0:
+            raise Exception(f"LibreOffice conversion error: {process.stderr.decode()}")
+        
+        # Get output PDF path
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        output_pdf = os.path.join(app.config['CONVERTED_FOLDER'], f"{base_name}.pdf")
+        
+        # Check if conversion succeeded
+        if not os.path.exists(output_pdf):
+            raise Exception("Conversion failed: PDF file not created")
+        
+        pdf_filename = os.path.basename(output_pdf)
+        update_convert_status(convert_id, "completed", output_pdf, pdf_filename)
+
+        return jsonify({
+            "status": "success",
+            "message": f"{file_extension.upper()} to PDF conversion completed",
+            "file_id": file_id,
+            "document_id": document_id,
+            "convert_id": convert_id,
+            "original_filename": original_filename,
+            "original_format": file_extension,
+            "converted_filename": pdf_filename,
+            "download_url": f"/download/converted/{pdf_filename}"
+        })
+
+    except Exception as e:
+        if convert_id:
+            update_convert_status(convert_id, "failed")
+        return jsonify({'error': str(e), 'status': 'failed'}), 500
+
+@app.route('/docs/api/tools/convert-image-to-pdf', methods=['POST'])
+def convert_image_to_pdf():
+    """
+    Endpoint untuk convert Image to PDF
+    """
+    convert_id = None  # Initialize to avoid NameError
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'Tidak ada file yang diupload', 'status': 'failed'}), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({'error': 'Tidak ada file yang dipilih', 'status': 'failed'}), 400
+
+        # Get file extension
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        
+        # Check file extension - support common image formats
+        allowed_image_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif']
+        if file_extension not in allowed_image_extensions:
+            return jsonify({'error': 'File harus berformat gambar (PNG, JPG, JPEG, GIF, BMP, TIFF)', 'status': 'failed'}), 400
+
+        original_filename = secure_filename(file.filename)
+        file_id = f"img_{uuid.uuid4().hex}_{original_filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        file.save(file_path)
+
+        file_size = os.path.getsize(file_path)
+
+        document_id = create_documents_entry(
+            original_filename,
+            file_path,
+            file_extension,  # .png, .jpg, etc
+            file_size,
+            1  # 1 page for image
+        )
+        convert_id, convert_uuid = create_convert_entry(document_id)
+
+        # Generate PDF filename
+        pdf_filename = f"{uuid.uuid4().hex}.pdf"
+        pdf_path = os.path.join(app.config['CONVERTED_FOLDER'], pdf_filename)
+
+        # Convert image to PDF using PIL and ReportLab
+        img = Image.open(file_path)
+        
+        # Convert to RGB if necessary (for PNG with transparency, etc.)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Save as PDF
+        img.save(pdf_path, 'PDF', resolution=100.0)
+
+        update_convert_status(convert_id, "completed", pdf_path, pdf_filename)
+
+        return jsonify({
+            "status": "success",
+            "message": "Image to PDF conversion completed",
+            "file_id": file_id,
+            "document_id": document_id,
+            "convert_id": convert_id,
+            "original_filename": original_filename,
+            "converted_filename": pdf_filename,
+            "download_url": f"/download/converted/{pdf_filename}"
+        })
+
+    except Exception as e:
+        if convert_id:  # ✅ Added error handling
+            update_convert_status(convert_id, "failed")
+        return jsonify({'error': str(e), 'status': 'failed'}), 500
+
+@app.route('/docs/api/tools/merge-pdf', methods=['POST'])
+def merge_pdf():
+    """
+    Endpoint untuk merge multiple PDF files
+    Upload multiple files with key 'files[]'
+    """
+    merge_id = None  # ✅ Initialize to avoid NameError
+    uploaded_files = []  # ✅ Initialize for cleanup
+    
+    try:
+        if 'files[]' not in request.files:
+            return jsonify({'error': 'Tidak ada file yang diupload. Gunakan key "files[]"', 'status': 'failed'}), 400
+
+        files = request.files.getlist('files[]')
+
+        if len(files) < 2:
+            return jsonify({'error': 'Minimal 2 file PDF untuk di-merge', 'status': 'failed'}), 400
+
+        # Validate all files are PDFs
+        for file in files:
+            if not allowed_file(file.filename):
+                return jsonify({'error': f'File {file.filename} bukan PDF', 'status': 'failed'}), 400
+
+        # Create merge entry first
+        merge_id = create_merge_entry([])  # ✅ Create merge entry with empty document_ids first
+        
+        document_ids = []
+        merger = PyPDF2.PdfMerger()
+
+        # Save and add each file to merger
+        for file in files:
+            original_filename = secure_filename(file.filename)
+            temp_id = f"temp_{uuid.uuid4().hex}_{original_filename}"
+            temp_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_id)
+            file.save(temp_path)
+
+            file_size = os.path.getsize(temp_path)
+            reader_temp = PyPDF2.PdfReader(temp_path)
+            total_pages = len(reader_temp.pages)
+
+            doc_id = create_documents_entry(
+                original_filename,
+                temp_path,
+                ".pdf",
+                file_size,
+                total_pages
+            )
+            document_ids.append(doc_id)
+            uploaded_files.append(temp_path)
+            
+            merger.append(temp_path)
+
+        # Generate merged PDF filename
+        merged_filename = f"merged_{uuid.uuid4().hex}.pdf"
+        merged_path = os.path.join(app.config['MERGED_FOLDER'], merged_filename)
+
+        # Write merged PDF
+        merger.write(merged_path)
+        merger.close()
+        
+        merged_size = os.path.getsize(merged_path)
+        
+        # Update merge status with completed info
+        update_merge_status(merge_id, "completed", merged_path, merged_filename, convert_size(merged_size))
+
+        # Update document_ids in merge table
+        conn = mysql.connector.connect(host="localhost", user="root", password="", database="dokumi")
+        cursor = conn.cursor()
+        cursor.execute("UPDATE merge_files SET document_id=%s WHERE id=%s", (json.dumps(document_ids), merge_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+        # Clean up temporary files
+        for temp_file in uploaded_files:
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+
+        return jsonify({
+            "status": "success",
+            "message": "PDF merge completed",
+            "merge_id": merge_id,
+            "merged_filename": merged_filename,
+            "files_merged": len(files),
+            "merged_size": convert_size(merged_size),
+            "download_url": f"/download/merged/{merged_filename}"
+        })
+
+    except Exception as e:
+        if merge_id:  # ✅ Check if merge_id exists before updating
+            update_merge_status(merge_id, "failed")
+        
+        # Clean up temporary files on error
+        for temp_file in uploaded_files:
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+                
+        return jsonify({'error': str(e), 'status': 'failed'}), 500
+
+@app.route('/docs/api/tools/split-pdf', methods=['POST'])
+def split_pdf():
+    """
+    Endpoint untuk split PDF file
+    Optional: page_ranges (e.g., "1-3,5,7-9") or split all pages
+    """
+    split_id = None  # ✅ Initialize to avoid NameError
+    
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'Tidak ada file yang diupload', 'status': 'failed'}), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({'error': 'Tidak ada file yang dipilih', 'status': 'failed'}), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'File harus berformat PDF', 'status': 'failed'}), 400
+
+        original_filename = secure_filename(file.filename)
+        file_id = f"split_{uuid.uuid4().hex}_{original_filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        file.save(file_path)
+        
+        file_size = os.path.getsize(file_path)
+        
+        # ✅ Read PDF FIRST to get total_pages
+        reader = PyPDF2.PdfReader(file_path)
+        total_pages = len(reader.pages)
+        
+        # ✅ Now create document entry with correct total_pages
+        document_id = create_documents_entry(
+            original_filename,
+            file_path,
+            ".pdf",
+            file_size,
+            total_pages
+        )
+
+        split_id, split_uuid = create_split_entry(document_id)
+
+        # Get page ranges from request (optional)
+        page_ranges = request.form.get('page_ranges', None)
+
+        # Create folder for split files
+        split_folder_name = f"split_{uuid.uuid4().hex}"
+        split_folder_path = os.path.join(app.config['SPLIT_FOLDER'], split_folder_name)
+        os.makedirs(split_folder_path, exist_ok=True)
+
+        split_files = []
+        total_split_size = 0  # ✅ Track total size of all split files
+
+        if page_ranges:
+            # Parse page ranges (e.g., "1-3,5,7-9")
+            ranges = page_ranges.split(',')
+            
+            for range_str in ranges:
+                range_str = range_str.strip()
+                
+                if '-' in range_str:
+                    # Range: 1-3
+                    start, end = map(int, range_str.split('-'))
+                    writer = PyPDF2.PdfWriter()
+                    
+                    for page_num in range(start - 1, end):
+                        if page_num < total_pages:
+                            writer.add_page(reader.pages[page_num])
+                    
+                    output_filename = f"pages_{start}-{end}.pdf"
+                    output_path = os.path.join(split_folder_path, output_filename)
+                    
+                    with open(output_path, 'wb') as output_file:
+                        writer.write(output_file)
+                    
+                    split_file_size = os.path.getsize(output_path)
+                    total_split_size += split_file_size
+                    split_files.append(output_filename)
+                else:
+                    # Single page: 5
+                    page_num = int(range_str) - 1
+                    
+                    if page_num < total_pages:
+                        writer = PyPDF2.PdfWriter()
+                        writer.add_page(reader.pages[page_num])
+                        
+                        output_filename = f"page_{page_num + 1}.pdf"
+                        output_path = os.path.join(split_folder_path, output_filename)
+                        
+                        with open(output_path, 'wb') as output_file:
+                            writer.write(output_file)
+                        
+                        split_file_size = os.path.getsize(output_path)
+                        total_split_size += split_file_size
+                        split_files.append(output_filename)
+        else:
+            # Split all pages individually
+            for page_num in range(total_pages):
+                writer = PyPDF2.PdfWriter()
+                writer.add_page(reader.pages[page_num])
+                
+                output_filename = f"page_{page_num + 1}.pdf"
+                output_path = os.path.join(split_folder_path, output_filename)
+                
+                with open(output_path, 'wb') as output_file:
+                    writer.write(output_file)
+                
+                split_file_size = os.path.getsize(output_path)
+                total_split_size += split_file_size
+                split_files.append(output_filename)
+
+        # ✅ Update ONCE at the end with final status
+        # Store first split file name as representative, or you could store JSON array
+        first_split_file = split_files[0] if split_files else None
+        update_split_status(
+            split_id, 
+            "completed", 
+            split_folder_path, 
+            first_split_file,  # Or json.dumps(split_files) if you want to store all names
+            convert_size(total_split_size)
+        )
+
+        return jsonify({
+            "status": "success",
+            "message": "PDF split completed",
+            "file_id": file_id,
+            "document_id": document_id,
+            "split_id": split_id,
+            "original_filename": original_filename,
+            "total_pages": total_pages,
+            "split_count": len(split_files),
+            "split_files": split_files,
+            "total_split_size": convert_size(total_split_size),
+            "download_folder": f"/download/splitted/{split_folder_name}"
+        })
+
+    except Exception as e:
+        if split_id:  # ✅ Check if split_id exists before updating
+            update_split_status(split_id, "failed")
+        return jsonify({'error': str(e), 'status': 'failed'}), 500
 
 # ==================== SWAGGER JSON ====================
 @app.route('/static/swagger.json')
@@ -902,8 +1553,8 @@ def swagger_json():
         "openapi": "3.0.0",
         "info": {
             "title": "PDF Tools API",
-            "description": "API untuk OCR dan Kompresi PDF",
-            "version": "1.0.0"
+            "description": "API untuk OCR, Kompresi, Konversi, Merge, dan Split PDF",
+            "version": "2.0.0"
         },
         "servers": [
             {
@@ -1027,10 +1678,310 @@ def swagger_json():
                         "200": {"description": "Success"}
                     }
                 }
+            },
+            # ==================== NEW ENDPOINTS ====================
+            "/docs/api/tools/convert-ppt-to-pdf": {
+                "post": {
+                    "summary": "Convert PPT/PPTX to PDF",
+                    "description": "Upload PPT atau PPTX untuk dikonversi ke PDF",
+                    "tags": ["Convert"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file": {
+                                            "type": "string",
+                                            "format": "binary",
+                                            "description": "File PPT/PPTX yang akan dikonversi"
+                                        }
+                                    },
+                                    "required": ["file"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Conversion successful",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "message": {"type": "string"},
+                                            "file_id": {"type": "string"},
+                                            "download_url": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/docs/api/tools/convert-doc-to-pdf": {
+                "post": {
+                    "summary": "Convert DOC/DOCX to PDF",
+                    "description": "Upload DOC atau DOCX untuk dikonversi ke PDF",
+                    "tags": ["Convert"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file": {
+                                            "type": "string",
+                                            "format": "binary",
+                                            "description": "File DOC/DOCX yang akan dikonversi"
+                                        }
+                                    },
+                                    "required": ["file"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Conversion successful",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "message": {"type": "string"},
+                                            "file_id": {"type": "string"},
+                                            "download_url": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/docs/api/tools/convert-image-to-pdf": {
+                "post": {
+                    "summary": "Convert Image to PDF",
+                    "description": "Upload gambar (PNG, JPG, JPEG, GIF, BMP, TIFF) untuk dikonversi ke PDF",
+                    "tags": ["Convert"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file": {
+                                            "type": "string",
+                                            "format": "binary",
+                                            "description": "File gambar yang akan dikonversi (PNG, JPG, JPEG, GIF, BMP, TIFF)"
+                                        }
+                                    },
+                                    "required": ["file"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Conversion successful",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "message": {"type": "string"},
+                                            "file_id": {"type": "string"},
+                                            "download_url": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/docs/api/tools/converted/list": {
+                "get": {
+                    "summary": "List All Converted Files",
+                    "description": "Dapatkan semua converted files dari database",
+                    "tags": ["Convert"],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "count": {"type": "integer"},
+                                            "data": {"type": "array"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/docs/api/tools/merge-pdf": {
+                "post": {
+                    "summary": "Merge Multiple PDFs",
+                    "description": "Upload multiple PDF files untuk digabungkan menjadi satu file PDF",
+                    "tags": ["Merge"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "files[]": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string",
+                                                "format": "binary"
+                                            },
+                                            "description": "Multiple PDF files (minimum 2 files)"
+                                        }
+                                    },
+                                    "required": ["files[]"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Merge successful",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "message": {"type": "string"},
+                                            "file_id": {"type": "string"},
+                                            "files_merged": {"type": "integer"},
+                                            "download_url": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/docs/api/tools/merged/list": {
+                "get": {
+                    "summary": "List All Merged Files",
+                    "description": "Dapatkan semua merged files dari database",
+                    "tags": ["Merge"],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "count": {"type": "integer"},
+                                            "data": {"type": "array"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/docs/api/tools/split-pdf": {
+                "post": {
+                    "summary": "Split PDF",
+                    "description": "Upload PDF untuk di-split menjadi file-file terpisah. Optional: page_ranges parameter untuk split halaman tertentu",
+                    "tags": ["Split"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file": {
+                                            "type": "string",
+                                            "format": "binary",
+                                            "description": "File PDF yang akan di-split"
+                                        },
+                                        "page_ranges": {
+                                            "type": "string",
+                                            "description": "Optional: Range halaman untuk split (contoh: '1-3,5,7-9'). Kosongkan untuk split semua halaman"
+                                        }
+                                    },
+                                    "required": ["file"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Split successful",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "message": {"type": "string"},
+                                            "file_id": {"type": "string"},
+                                            "total_pages": {"type": "integer"},
+                                            "split_count": {"type": "integer"},
+                                            "split_files": {"type": "array"},
+                                            "download_folder": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/docs/api/tools/split/list": {
+                "get": {
+                    "summary": "List All Split Files",
+                    "description": "Dapatkan semua split files dari database",
+                    "tags": ["Split"],
+                    "responses": {
+                        "200": {
+                            "description": "Success",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {"type": "string"},
+                                            "count": {"type": "integer"},
+                                            "data": {"type": "array"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     return jsonify(swagger_spec)
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5001)

@@ -8,3 +8,6 @@ Werkzeug==3.0.1
 pycryptodome==3.23.0
 pydantic_settings
 alembic==1.17.2
+flask_cors
+flask-cors
+mysql-connector-python

@@ -2,7 +2,6 @@
 settings.py
 models.py
 /uploads
-/routes
 /ocr_results
 /compressed
 /outputs
