@@ -13,8 +13,11 @@ import mysql.connector
 from mysql.connector import Error
 import json
 import subprocess
+from dotenv import load_dotenv
 
 app = Flask(__name__)
+
+load_dotenv()
 
 # Enable CORS untuk semua routes
 CORS(app, resources={
@@ -59,11 +62,11 @@ app.config['MERGED_FOLDER'] = MERGED_FOLDER
 # Konfigurasi untuk DBngin (Mac)
 # DBngin biasanya menggunakan port berbeda, cek di aplikasi DBngin
 DB_CONFIG = {
-    'host': '127.0.0.1',  # atau 'localhost'
-    'user': 'root',
-    'password': '',  # Ganti dengan password MariaDB Anda (biasanya kosong untuk DBngin)
-    'database': 'pdf_tools_db',
-    'port': 3306  # Cek port di DBngin, bisa jadi 3306, 13306, atau port lain
+    'host': os.getenv('DB_HOST', '127.0.0.1'),
+    'user': os.getenv('DB_USER', 'root'),
+    'password': os.getenv('DB_PASS', ''),  # default kosong kalau tidak ada
+    'database': os.getenv('DB_NAME', 'pdf_tools_db'),
+    'port': int(os.getenv('DB_PORT', 3306)),
 }
 
 def get_db_connection():
