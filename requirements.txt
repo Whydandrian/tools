@@ -11,3 +11,5 @@ alembic==1.17.2
 flask_cors
 flask-cors
 mysql-connector-python
+celery==5.3.3
+requests==2.31.0

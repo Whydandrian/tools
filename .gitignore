@@ -5,4 +5,7 @@ models.py
 /ocr_results
 /compressed
 /outputs
+/converted
+/merged
+/splitted
 *__pycache__/

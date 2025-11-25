@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_swagger_ui import get_swaggerui_blueprint
-from flask_cors import CORS
+from flask_cors import CORS, cross_origin
 from werkzeug.utils import secure_filename
 import os
 from datetime import datetime
@@ -33,6 +33,11 @@ CONVERTED_FOLDER = 'converted'
 SPLIT_FOLDER = 'splitted'
 MERGED_FOLDER = 'merged'
 ALLOWED_EXTENSIONS = {'pdf'}
+
+CALLBACK_URL = os.getenv("CALLBACK_URL")
+CALLBACK_TOKEN = os.getenv("CALLBACK_TOKEN")
+
+BASE_URL = os.getenv("BASE_URL", "http://localhost:5001")
 
 # Buat folder jika belum ada
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -308,27 +313,63 @@ def create_ocr_entry(document_id):
     return ocr_id
 
 
-def update_ocr_status(ocr_id, status, extracted_text=""):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
-    cursor = conn.cursor()
+def update_ocr_status(ocr_id, status, extracted_text="", metadata_file=None):
+    if not ocr_id:
+        # Jangan coba update jika ocr_id falsy
+        return False
 
-    sql = """
-        UPDATE ocr_files 
-        SET status=%s, extracted_text=%s, updated_at=%s
-        WHERE id=%s
-    """
+    # Pastikan extracted_text selalu string (hindari None)
+    if extracted_text is None:
+        extracted_text = ""
 
-    now = datetime.now()
-    cursor.execute(sql, (status, extracted_text, now, ocr_id))
-    conn.commit()
+    # Convert to str explicitly (safety)
+    extracted_text = str(extracted_text)
 
-    cursor.close()
-    conn.close()
+    try:
+        conn = mysql.connector.connect(
+            host="localhost",
+            user="root",
+            password="",
+            database="dokumi",
+            charset="utf8mb4",
+            use_unicode=True
+        )
+        cursor = conn.cursor()
+
+        # Jika ingin juga menyimpan metadata JSON (opsional)
+        if metadata_file is not None:
+            sql = """
+                UPDATE ocr_files
+                SET status=%s, extracted_text=%s, metadata_file=%s, updated_at=%s
+                WHERE id=%s
+            """
+            params = (status, extracted_text, metadata_file, datetime.now(), ocr_id)
+        else:
+            sql = """
+                UPDATE ocr_files
+                SET status=%s, extracted_text=%s, updated_at=%s
+                WHERE id=%s
+            """
+            params = (status, extracted_text, datetime.now(), ocr_id)
+
+        cursor.execute(sql, params)
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+        return True
+
+    except Error as e:
+        # Anda bisa mengganti print dengan logger jika tersedia
+        print(f"[update_ocr_status] MySQL Error: {e}")
+        try:
+            if cursor:
+                cursor.close()
+            if conn and conn.is_connected():
+                conn.close()
+        except:
+            pass
+        return False
 
 def insert_ocr_page(document_id, page_number, text):
     try:
@@ -600,6 +641,26 @@ def update_split_status(split_id, status, splited_path=None, splited_file_name=N
     cursor.close()
     conn.close()
 
+# Callback to Sirama API
+def send_callback_to_sirama(letter_id, full_text, compressed_url):
+    payload = {
+        "letter_id": letter_id,
+        "extracted_text": full_text,
+        "download_url": compressed_url
+    }
+
+    headers = {
+        "Authorization": f"Bearer {CALLBACK_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(CALLBACK_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        print("Callback success:", response.json())
+    except Exception as callback_err:
+        print("Callback failed:", callback_err)
+
 
 # ==================== OCR ENDPOINT ====================
 @app.route('/docs/api/tools/ocr', methods=['POST'])
@@ -693,6 +754,8 @@ def ocr_pdf():
                 # Simpan ke list untuk response
                 text_by_page.append({"page": page_num, "text": page_text})
 
+                full_text += f"\n\n===== PAGE {page_num} =====\n{page_text}\n"
+
                 # ⬅ INSERT ke database: 1 baris per halaman
                 insert_ocr_page(document_id, page_num, page_text)
 
@@ -709,6 +772,14 @@ def ocr_pdf():
         # Update DB
         update_ocr_status(ocr_id, "completed", full_text)
 
+        # Kirim ke Celery
+        task = ocr_and_compress.delay(
+            document_id=document_id,
+            file_path=file_path,
+            pdf_password=pdf_password,
+            letter_id=letter_id
+        )
+
         # Return JSON
         return jsonify({
             "status": "success",
@@ -716,7 +787,7 @@ def ocr_pdf():
             "document_id": document_id,
             "ocr_id": ocr_id,
             "output_text_path": ocr_output_path,
-            "download_url": f"/download/ocr/{ocr_filename}",
+            "download_url": f"{BASE_URL}/download/ocr/{ocr_filename}",
             "pages": len(pages),
             "text_by_page": text_by_page
         })
@@ -727,6 +798,45 @@ def ocr_pdf():
         except:
             pass
         return jsonify({'error': str(e), 'status': 'failed'}), 500
+
+@app.route('/docs/api/tools/ocr-async', methods=['POST'])
+def ocr_async():
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'Tidak ada file yang diupload', 'status': 'failed'}), 400
+
+        file = request.files['file']
+        letter_id = request.form.get('letter_id')   # dari SIRAMA
+        pdf_password = request.form.get('password', None)
+        compressed_url = request.form.get('compressed_url', None)
+
+        # Save file
+        original_filename = secure_filename(file.filename)
+        file_id = f"ocr_{uuid.uuid4().hex}_{original_filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
+        file.save(file_path)
+
+        # === PANGGIL QUEUE CELERY ===
+        ocr_task.delay(
+            document_id=letter_id,  
+            file_path=file_path,
+            pdf_password=pdf_password,
+            callback_data={
+                "letter_id": letter_id,
+                "download_url": compressed_url
+            }
+        )
+
+        return jsonify({
+            "status": "queued",
+            "message": "OCR is being processed asynchronously",
+            "letter_id": letter_id
+        })
+
+    except Exception as e:
+        return jsonify({'status': 'failed', 'error': str(e)}), 500
+
+
 
 # ==================== COMPRESS PDF ENDPOINT ====================
 @app.route('/docs/api/tools/compress-pdf', methods=['POST'])
@@ -745,107 +855,59 @@ def compress_pdf():
             return jsonify({'error': 'Tidak ada file yang dipilih', 'status': 'failed'}), 400
 
         if not allowed_file(file.filename):
-            return jsonify({'error': 'File harus berformat PDF', 'status': 'failed'}), 400
+            return jsonify({'error': 'File harus PDF', 'status': 'failed'}), 400
 
-        pdf_password = request.form.get('password', None)
-
-        # Save input PDF
+        # Simpan file input
         original_filename = secure_filename(file.filename)
-        file_id = f"ocr_{uuid.uuid4().hex}_{original_filename}"
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
-        file.save(file_path)
+        file_id = f"cmp_{uuid.uuid4().hex}_{original_filename}"
+        input_path = os.path.join(app.config["UPLOAD_FOLDER"], file_id)
+        file.save(input_path)
 
-        file_size = os.path.getsize(file_path)
+        # Output filename
+        compressed_name = f"{uuid.uuid4().hex}_compressed.pdf"
+        output_path = os.path.join(app.config["COMPRESSED_FOLDER"], compressed_name)
 
-        # Total pages
-        reader = PyPDF2.PdfReader(file_path)
-        total_pages = len(reader.pages)
+        # Ghostscript command (high compression)
+        gs_command = [
+            "gs",
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/ebook",   # /screen = kecil sekali, /ebook = balanced, /prepress = high quality
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={output_path}",
+            input_path
+        ]
 
-        # INSERT → documents
-        document_id = create_documents_entry(
-            original_filename,
-            file_path,
-            ".pdf",
-            file_size,
-            total_pages
-        )
+        # Jalankan kompresi
+        import subprocess
+        result = subprocess.run(gs_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # INSERT → ocr_files
-        ocr_id = create_ocr_entry(document_id)
+        if result.returncode != 0:
+            return jsonify({
+                "status": "failed",
+                "error": "Gagal melakukan kompres PDF",
+                "detail": result.stderr.decode()
+            }), 500
 
-        # Prepare OCR output folder
-        ocr_folder = os.path.join(os.getcwd(), "ocr_results")
-        os.makedirs(ocr_folder, exist_ok=True)
+        # Cek file size
+        original_size = os.path.getsize(input_path)
+        compressed_size = os.path.getsize(output_path)
 
-        # Generate result filename
-        ocr_filename = f"{uuid.uuid4().hex}_ocr.txt"
-        ocr_output_path = os.path.join(ocr_folder, ocr_filename)
+        reduction_percent = 100 - ((compressed_size / original_size) * 100)
 
-        # Handle encryption
-        if reader.is_encrypted:
-            decrypted = False
-            try_passwords = []
-            if pdf_password:
-                try_passwords.append(pdf_password)
-            try_passwords.append("")
-            for pw in try_passwords:
-                try:
-                    res = reader.decrypt(pw)
-                    if res == 1 or res is True:
-                        decrypted = True
-                        break
-                except:
-                    pass
-            if not decrypted:
-                update_ocr_status(ocr_id, "failed")
-                return jsonify({'error': 'PDF terenkripsi. Tambahkan password.', 'status': 'failed'}), 400
-
-        # Convert PDF → Images
-        pages = convert_from_path(
-            file_path,
-            dpi=300,
-            fmt="png",
-            userpw=pdf_password if pdf_password else None
-        )
-
-        # OCR process
-        ocr_lang = "eng+ind"
-        full_text = ""
-        text_by_page = []
-
-        for page_num, img in enumerate(pages, start=1):
-            try:
-                page_text = pytesseract.image_to_string(img, lang=ocr_lang)
-                full_text += f"\n\n--- Halaman {page_num} ---\n\n{page_text}"
-                text_by_page.append({"page": page_num, "text": page_text})
-            except Exception as e_page:
-                text_by_page.append({"page": page_num, "text": f"ERROR: {e_page}"})
-
-        # Save extracted text
-        with open(ocr_output_path, "w", encoding="utf-8") as f:
-            f.write(full_text)
-
-        # Update DB
-        update_ocr_status(ocr_id, "completed", full_text)
-
-        # Return JSON
         return jsonify({
             "status": "success",
-            "message": "OCR completed",
-            "document_id": document_id,
-            "ocr_id": ocr_id,
-            "output_text_path": ocr_output_path,
-            "download_url": f"/download/ocr/{ocr_filename}",
-            "pages": len(pages),
-            "text_by_page": text_by_page
+            "message": "Berhasil mengkompres PDF",
+            "original_size": original_size,
+            "compressed_size": compressed_size,
+            "reduction_percent": round(reduction_percent, 2),
+            "download_url": f"{BASE_URL}/download/compressed/{compressed_name}"
         })
 
     except Exception as e:
-        try:
-            update_ocr_status(ocr_id, "failed")
-        except:
-            pass
-        return jsonify({'error': str(e), 'status': 'failed'}), 500
+        return jsonify({'status': 'failed', 'error': str(e)}), 500
 
 # ==================== INFO ENDPOINTS ====================
 @app.route('/docs/api/tools/ocr/info/<file_id>', methods=['GET'])
@@ -1032,8 +1094,8 @@ curl http://localhost:5000/docs/api/tools/compress/list</code></pre>
     </body>
     </html>
     """
-
 @app.route('/download/<path:folder>/<path:filename>', methods=['GET'])
+@cross_origin(origins="*")
 def download_file(folder, filename):
     base_path = {
         "ocr": app.config['OUTPUT_OCR_FOLDER'],
@@ -1051,7 +1113,12 @@ def download_file(folder, filename):
     if not os.path.exists(file_path):
         return jsonify({"error": "File not found"}), 404
 
-    return send_file(file_path, as_attachment=True)
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/pdf"
+    )
 
 # ==================== NEW ENDPOINTS ====================
 
@@ -1130,7 +1197,7 @@ def convert_ppt_to_pdf():
             "original_filename": original_filename,
             "original_format": file_extension,
             "converted_filename": pdf_filename,
-            "download_url": f"/download/converted/{pdf_filename}"
+            "download_url": f"{BASE_URL}/download/converted/{pdf_filename}"
         })
 
     except subprocess.TimeoutExpired:
@@ -1216,7 +1283,7 @@ def convert_doc_to_pdf():
             "original_filename": original_filename,
             "original_format": file_extension,
             "converted_filename": pdf_filename,
-            "download_url": f"/download/converted/{pdf_filename}"
+            "download_url": f"{BASE_URL}/download/converted/{pdf_filename}"
         })
 
     except Exception as e:
@@ -1293,7 +1360,7 @@ def convert_image_to_pdf():
             "convert_id": convert_id,
             "original_filename": original_filename,
             "converted_filename": pdf_filename,
-            "download_url": f"/download/converted/{pdf_filename}"
+            "download_url": f"{BASE_URL}/download/converted/{pdf_filename}"
         })
 
     except Exception as e:
@@ -1388,7 +1455,7 @@ def merge_pdf():
             "merged_filename": merged_filename,
             "files_merged": len(files),
             "merged_size": convert_size(merged_size),
-            "download_url": f"/download/merged/{merged_filename}"
+            "download_url": f"{BASE_URL}/download/merged/{merged_filename}"
         })
 
     except Exception as e:
