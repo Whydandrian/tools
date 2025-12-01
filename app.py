@@ -14,6 +14,7 @@ from mysql.connector import Error
 import json
 import subprocess
 from dotenv import load_dotenv
+from tasks import ocr_task
 
 app = Flask(__name__)
 
@@ -804,14 +805,45 @@ def ocr_pdf():
 
 @app.route('/docs/api/tools/ocr-async', methods=['POST'])
 def ocr_async():
+    """
+    Endpoint untuk OCR asynchronous dengan Celery
+    Form fields:
+    - file: PDF file
+    - letter_id: ID surat dari SIRAMA
+    - password: (optional) Password PDF jika terenkripsi
+    - compressed_url: (optional) URL file compressed
+    """
     try:
         if 'file' not in request.files:
-            return jsonify({'error': 'Tidak ada file yang diupload', 'status': 'failed'}), 400
+            return jsonify({
+                'error': 'Tidak ada file yang diupload',
+                'status': 'failed'
+            }), 400
 
         file = request.files['file']
-        letter_id = request.form.get('letter_id')   # dari SIRAMA
+        
+        if file.filename == '':
+            return jsonify({
+                'error': 'Tidak ada file yang dipilih',
+                'status': 'failed'
+            }), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({
+                'error': 'File harus berformat PDF',
+                'status': 'failed'
+            }), 400
+
+        # Get form data
+        letter_id = request.form.get('letter_id')
         pdf_password = request.form.get('password', None)
-        compressed_url = request.form.get('compressed_url', None)
+        compressed_url = request.form.get('compressed_url', '')
+
+        if not letter_id:
+            return jsonify({
+                'error': 'letter_id is required',
+                'status': 'failed'
+            }), 400
 
         # Save file
         original_filename = secure_filename(file.filename)
@@ -819,9 +851,30 @@ def ocr_async():
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
         file.save(file_path)
 
-        # === PANGGIL QUEUE CELERY ===
-        ocr_task.delay(
-            document_id=letter_id,  
+        file_size = os.path.getsize(file_path)
+
+        # Get total pages
+        try:
+            reader = PyPDF2.PdfReader(file_path)
+            total_pages = len(reader.pages)
+        except:
+            total_pages = 0
+
+        # Create document entry
+        document_id = create_documents_entry(
+            original_filename,
+            file_path,
+            ".pdf",
+            file_size,
+            total_pages
+        )
+
+        # Create OCR entry
+        ocr_id = create_ocr_entry(document_id)
+
+        # Queue task to Celery
+        task = ocr_task.delay(
+            document_id=document_id,
             file_path=file_path,
             pdf_password=pdf_password,
             callback_data={
@@ -833,13 +886,58 @@ def ocr_async():
         return jsonify({
             "status": "queued",
             "message": "OCR is being processed asynchronously",
-            "letter_id": letter_id
-        })
+            "letter_id": letter_id,
+            "document_id": document_id,
+            "ocr_id": ocr_id,
+            "task_id": task.id,
+            "original_filename": original_filename
+        }), 202  # 202 Accepted
 
     except Exception as e:
-        return jsonify({'status': 'failed', 'error': str(e)}), 500
+        return jsonify({
+            'status': 'failed',
+            'error': str(e)
+        }), 500
 
 
+# Optional: Endpoint untuk check status task
+@app.route('/docs/api/tools/task-status/<task_id>', methods=['GET'])
+def check_task_status(task_id):
+    """Check status of Celery task"""
+    from celery.result import AsyncResult
+    from tasks import celery
+    
+    task = AsyncResult(task_id, app=celery)
+    
+    if task.state == 'PENDING':
+        response = {
+            'status': 'pending',
+            'message': 'Task is waiting to be executed'
+        }
+    elif task.state == 'STARTED':
+        response = {
+            'status': 'processing',
+            'message': 'Task is currently being processed'
+        }
+    elif task.state == 'SUCCESS':
+        response = {
+            'status': 'completed',
+            'message': 'Task completed successfully',
+            'result': task.result
+        }
+    elif task.state == 'FAILURE':
+        response = {
+            'status': 'failed',
+            'message': 'Task failed',
+            'error': str(task.info)
+        }
+    else:
+        response = {
+            'status': task.state,
+            'message': 'Unknown task state'
+        }
+    
+    return jsonify(response)
 
 # ==================== COMPRESS PDF ENDPOINT ====================
 @app.route('/docs/api/tools/compress-pdf', methods=['POST'])
