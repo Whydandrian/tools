@@ -41,7 +41,7 @@ ALLOWED_EXTENSIONS = {'pdf'}
 CALLBACK_URL = os.getenv("CALLBACK_URL")
 CALLBACK_TOKEN = os.getenv("CALLBACK_TOKEN")
 
-BASE_URL = os.getenv("BASE_URL", "http://localhost:5001")
+BASE_URL = os.getenv("BASE_URL")
 
 # Buat folder jika belum ada
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -1718,7 +1718,7 @@ def split_pdf():
 def swagger_json():
     """Swagger specification"""
 
-    BASE_URL = os.getenv("BASE_URL", "http://localhost:5001")
+    BASE_URL = os.getenv("BASE_URL")
 
     swagger_spec = {
         "openapi": "3.0.0",
