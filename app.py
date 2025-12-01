@@ -1717,6 +1717,9 @@ def split_pdf():
 @app.route('/static/swagger.json')
 def swagger_json():
     """Swagger specification"""
+
+    BASE_URL = os.getenv("BASE_URL", "http://localhost:5001")
+
     swagger_spec = {
         "openapi": "3.0.0",
         "info": {
@@ -1726,7 +1729,7 @@ def swagger_json():
         },
         "servers": [
             {
-                "url": "http://localhost:5001",
+                "url": BASE_URL,
                 "description": "Development server"
             }
         ],
