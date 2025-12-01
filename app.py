@@ -21,13 +21,35 @@ app = Flask(__name__)
 load_dotenv()
 
 # Enable CORS untuk semua routes
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+CORS(app, 
+     resources={
+         r"/*": {
+             "origins": "*",
+             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+             "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+             "expose_headers": ["Content-Type", "Content-Disposition"],
+             "supports_credentials": False,
+             "max_age": 3600
+         }
+     })
+
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    response.headers.add('Access-Control-Max-Age', '3600')
+    return response
+
+# Handle OPTIONS globally
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,Accept')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+        return response
 
 # Konfigurasi
 UPLOAD_FOLDER = 'uploads'
@@ -1718,7 +1740,7 @@ def split_pdf():
 def swagger_json():
     """Swagger specification"""
 
-    BASE_URL = os.getenv("BASE_URL")
+    BASE_URL = os.getenv("BASE_URL", "https://tools.itk.ac.id")
 
     swagger_spec = {
         "openapi": "3.0.0",
