@@ -93,12 +93,20 @@ DB_CONFIG = {
 }
 
 def get_db_connection():
-    """Membuat koneksi ke database MariaDB"""
+    """Get connection to dokumi database using environment variables"""
     try:
-        connection = mysql.connector.connect(**DB_CONFIG)
+        connection = mysql.connector.connect(
+            host=os.getenv('DB_HOST', '127.0.0.1'),
+            user=os.getenv('DB_USER', 'root'),
+            password=os.getenv('DB_PASS', ''),
+            database=os.getenv('DB_NAME', 'dokumi'),
+            port=int(os.getenv('DB_PORT', 3306)),
+            charset='utf8mb4',
+            use_unicode=True
+        )
         return connection
     except Error as e:
-        print(f"Error connecting to MariaDB: {e}")
+        print(f"Error connecting to dokumi database: {e}")
         return None
 
 def init_database():
@@ -278,12 +286,7 @@ def get_compress_from_db(file_id):
 
 # ===================== OCR AND COMPRESS helper function ===========================
 def create_documents_entry(original_filename, file_path, file_type, size, total_page):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     sql = """
@@ -315,12 +318,7 @@ def create_documents_entry(original_filename, file_path, file_type, size, total_
 
 
 def create_ocr_entry(document_id):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     sql = """
@@ -352,14 +350,7 @@ def update_ocr_status(ocr_id, status, extracted_text="", metadata_file=None):
     extracted_text = str(extracted_text)
 
     try:
-        conn = mysql.connector.connect(
-            host="localhost",
-            user="root",
-            password="",
-            database="dokumi",
-            charset="utf8mb4",
-            use_unicode=True
-        )
+        conn = get_db_connection()
         cursor = conn.cursor()
 
         # Jika ingin juga menyimpan metadata JSON (opsional)
@@ -417,12 +408,7 @@ def insert_ocr_page(document_id, page_number, text):
 
 
 def create_compressed_entry(document_id):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     now = datetime.now()
@@ -442,12 +428,7 @@ def create_compressed_entry(document_id):
 
 
 def update_compress_status(compress_id, status, output_path=None, output_size=None):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     sql = """
@@ -522,12 +503,7 @@ def compress_with_gs(input_path, output_path, quality="screen"):
 
 
 def create_convert_entry(document_id):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     uuid_str = uuid.uuid4().hex
@@ -548,12 +524,7 @@ def create_convert_entry(document_id):
 
 
 def update_convert_status(convert_id, status, converted_path=None, converted_file_name=None):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     sql = """
@@ -571,12 +542,7 @@ def update_convert_status(convert_id, status, converted_path=None, converted_fil
 
 
 def create_merge_entry(document_ids):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     now = datetime.now()
@@ -597,12 +563,7 @@ def create_merge_entry(document_ids):
 
 
 def update_merge_status(merge_id, status, merged_path=None, merged_file_name=None, merged_size=None):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     sql = """
@@ -620,12 +581,7 @@ def update_merge_status(merge_id, status, merged_path=None, merged_file_name=Non
 
 
 def create_split_entry(document_id):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     uuid_str = uuid.uuid4().hex
@@ -646,12 +602,7 @@ def create_split_entry(document_id):
 
 
 def update_split_status(split_id, status, splited_path=None, splited_file_name=None, splited_size=None):
-    conn = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="",
-        database="dokumi"
-    )
+    conn = get_db_connection()
     cursor = conn.cursor()
 
     sql = """
@@ -1557,7 +1508,7 @@ def merge_pdf():
         update_merge_status(merge_id, "completed", merged_path, merged_filename, convert_size(merged_size))
 
         # Update document_ids in merge table
-        conn = mysql.connector.connect(host="localhost", user="root", password="", database="dokumi")
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("UPDATE merge_files SET document_id=%s WHERE id=%s", (json.dumps(document_ids), merge_id))
         conn.commit()
