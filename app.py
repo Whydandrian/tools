@@ -943,7 +943,7 @@ def compress_pdf():
 
         # Ghostscript command (high compression)
         gs_command = [
-            "gs",
+            "/usr/bin/gs",
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
             "-dPDFSETTINGS=/ebook",   # /screen = kecil sekali, /ebook = balanced, /prepress = high quality
