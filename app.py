@@ -485,7 +485,7 @@ def compress_with_gs(input_path, output_path, quality="screen"):
 
     # command GS
     cmd = [
-        "gs",
+        "/usr/bin/gs",
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
         "-dPDFSETTINGS=/" + quality,
