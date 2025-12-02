@@ -15,6 +15,7 @@ import json
 import subprocess
 from dotenv import load_dotenv
 from tasks import ocr_task
+from tools_config import GHOSTSCRIPT_PATH, LIBREOFFICE_PATH
 
 app = Flask(__name__)
 
@@ -485,7 +486,7 @@ def compress_with_gs(input_path, output_path, quality="screen"):
 
     # command GS
     cmd = [
-        "/usr/bin/gs",
+        GHOSTSCRIPT_PATH,
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
         "-dPDFSETTINGS=/" + quality,
@@ -716,7 +717,8 @@ def ocr_pdf():
             file_path,
             dpi=300,
             fmt="png",
-            userpw=pdf_password if pdf_password else None
+            userpw=pdf_password if pdf_password else None,
+            poppler_path="/usr/bin"
         )
 
         # OCR process
@@ -943,7 +945,7 @@ def compress_pdf():
 
         # Ghostscript command (high compression)
         gs_command = [
-            "/usr/bin/gs",
+            GHOSTSCRIPT_PATH,
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
             "-dPDFSETTINGS=/ebook",   # /screen = kecil sekali, /ebook = balanced, /prepress = high quality
@@ -1236,7 +1238,7 @@ def convert_ppt_to_pdf():
         
         # Convert using LibreOffice command (works for both .ppt and .pptx)
         cmd = [
-            'soffice',
+            LIBREOFFICE_PATH,
             '--headless',
             '--convert-to',
             'pdf',
@@ -1323,7 +1325,7 @@ def convert_doc_to_pdf():
         
         # Convert using LibreOffice command (works for both .doc and .docx)
         cmd = [
-            'soffice',
+            LIBREOFFICE_PATH,
             '--headless',
             '--convert-to',
             'pdf',
