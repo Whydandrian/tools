@@ -852,13 +852,13 @@ def ocr_async():
         ocr_id = create_ocr_entry(document_id)
 
         # Queue task to Celery
-        task = ocr_task.delay(
+        task = ocr_and_compress_task.delay(
             document_id=document_id,
             file_path=file_path,
             pdf_password=pdf_password,
             callback_data={
                 "letter_id": letter_id,
-                "download_url": compressed_url
+                "download_url": f"{BASE_URL}/download/ocr/{ocr_filename}"
             }
         )
 
