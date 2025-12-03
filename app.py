@@ -752,6 +752,8 @@ def ocr_pdf():
         # Update DB
         update_ocr_status(ocr_id, "completed", full_text)
 
+        letter_id = request.form.get('letter_id')
+
         # Kirim ke Celery
         task = ocr_and_compress_task.delay(
             document_id=document_id,
