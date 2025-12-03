@@ -15,6 +15,7 @@ import json
 import subprocess
 from dotenv import load_dotenv
 from tasks import ocr_task
+from tasks import ocr_and_compress_task
 from tools_config import GHOSTSCRIPT_PATH, LIBREOFFICE_PATH
 
 app = Flask(__name__)
@@ -752,11 +753,14 @@ def ocr_pdf():
         update_ocr_status(ocr_id, "completed", full_text)
 
         # Kirim ke Celery
-        task = ocr_and_compress.delay(
+        task = ocr_and_compress_task.delay(
             document_id=document_id,
             file_path=file_path,
             pdf_password=pdf_password,
-            letter_id=letter_id
+            callback_data={
+                "letter_id": letter_id,
+                "download_url": f"{BASE_URL}/download/ocr/{ocr_filename}"
+            }
         )
 
         # Return JSON
