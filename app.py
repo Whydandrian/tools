@@ -949,6 +949,24 @@ def compress_pdf():
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
             "-dPDFSETTINGS=/ebook",   # /screen = kecil sekali, /ebook = balanced, /prepress = high quality
+
+            # Downsample gambar
+            "-dColorImageDownsampleType=/Average",
+            "-dColorImageResolution=72",
+            "-dGrayImageDownsampleType=/Average",
+            "-dGrayImageResolution=72",
+            "-dMonoImageDownsampleType=/Subsample",
+            "-dMonoImageResolution=72",
+
+            # JPEG compression
+            "-dAutoFilterColorImages=false",
+            "-dAutoFilterGrayImages=false",
+            "-dColorImageFilter=/DCTEncode",
+            "-dGrayImageFilter=/DCTEncode",
+
+            # Quality JPEG (0.1 = sangat kecil, 0.4 = sedang)
+            "-dJPEGQ=40",
+
             "-dNOPAUSE",
             "-dQUIET",
             "-dBATCH",
