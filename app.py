@@ -1194,7 +1194,7 @@ curl http://localhost:5000/docs/api/tools/compress/list</code></pre>
     </html>
     """
 @app.route('/download/<path:folder>/<path:filename>', methods=['GET'])
-@cross_origin(origins="*")
+#@cross_origin(origins="*")
 def download_file(folder, filename):
     base_path = {
         "ocr": app.config['OUTPUT_OCR_FOLDER'],
