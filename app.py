@@ -15,7 +15,6 @@ import json
 import subprocess
 from dotenv import load_dotenv
 from tasks import ocr_task
-from tasks import ocr_and_compress_task
 from tools_config import GHOSTSCRIPT_PATH, LIBREOFFICE_PATH
 
 app = Flask(__name__)
@@ -35,23 +34,23 @@ CORS(app,
          }
      })
 
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,Accept')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    response.headers.add('Access-Control-Max-Age', '3600')
-    return response
+# @app.after_request
+# def after_request(response):
+#     response.headers.add('Access-Control-Allow-Origin', '*')
+#     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,Accept')
+#     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+#     response.headers.add('Access-Control-Max-Age', '3600')
+#     return response
 
 # Handle OPTIONS globally
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        response = app.make_default_options_response()
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,Accept')
-        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-        return response
+# @app.before_request
+# def handle_preflight():
+#     if request.method == "OPTIONS":
+#         response = app.make_default_options_response()
+#         response.headers.add('Access-Control-Allow-Origin', '*')
+#         response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-Requested-With,Accept')
+#         response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+#         return response
 
 # Konfigurasi
 UPLOAD_FOLDER = 'uploads'
@@ -670,6 +669,8 @@ def ocr_pdf():
 
         file_size = os.path.getsize(file_path)
 
+        letter_id = request.form.get('letter_id')
+
         # Total pages
         reader = PyPDF2.PdfReader(file_path)
         total_pages = len(reader.pages)
@@ -751,8 +752,6 @@ def ocr_pdf():
 
         # Update DB
         update_ocr_status(ocr_id, "completed", full_text)
-
-        letter_id = request.form.get('letter_id')
 
         # Kirim ke Celery
         task = ocr_and_compress_task.delay(
