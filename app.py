@@ -919,6 +919,33 @@ def check_task_status(task_id):
     
     return jsonify(response)
 
+def is_pdf_broken(path):
+    """
+    Mengembalikan True jika PDF rusak/pecah.
+    """
+    try:
+        with pikepdf.open(path) as pdf:
+            # Coba baca semua halaman
+            for page in pdf.pages:
+                _ = page.obj
+    except Exception:
+        return True
+
+    return False
+
+def choose_gs_profile(file_path):
+    """Determine suitable Ghostscript compression profile."""
+    size = os.path.getsize(file_path)
+
+    if size < 500 * 1024:  # < 500KB
+        return "/ebook"    # medium compression (tidak terlalu agresif)
+
+    elif size < 1 * 1024 * 1024:  # 500KB - 1MB
+        return "/ebook"    # tetap medium compression
+
+    else:
+        return "/screen"   # >1MB: lebih agresif
+
 # ==================== COMPRESS PDF ENDPOINT ====================
 @app.route('/docs/api/tools/compress-pdf', methods=['POST'])
 def compress_pdf():
@@ -949,11 +976,12 @@ def compress_pdf():
         output_path = os.path.join(app.config["COMPRESSED_FOLDER"], compressed_name)
 
         # Ghostscript command (high compression)
+        profile = choose_gs_profile(input_path)
         gs_command = [
             GHOSTSCRIPT_PATH,
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
-            "-dPDFSETTINGS=/ebook",   # /screen = kecil sekali, /ebook = balanced, /prepress = high quality
+            f"-dPDFSETTINGS={profile}",   # /screen = kecil sekali, /ebook = balanced, /prepress = high quality
 
             # Downsample gambar
             "-dColorImageDownsampleType=/Average",
