@@ -45,16 +45,61 @@ def detect_ghostscript():
     # 4. Jika semuanya gagal, pakai default
     return GHOSTSCRIPT_PATH
 
+def detect_poppler():
+    """
+    Mencari Poppler (pdftoppm) secara otomatis di macOS dan Linux.
+    Prioritas:
+    1. PATH environment (shutil.which)
+    2. Lokasi umum Linux
+    3. Lokasi umum macOS
+    4. Variabel default (/usr/bin)
+    
+    Return: Path ke direktori bin Poppler (untuk pdf2image)
+    """
+    # 1. Coba deteksi pdftoppm via PATH
+    pdftoppm = shutil.which("pdftoppm")
+    if pdftoppm:
+        # Return direktori parent (pdf2image butuh folder bin, bukan file)
+        return os.path.dirname(pdftoppm)
+
+    # 2. Lokasi umum Linux (Debian/Ubuntu/CentOS)
+    linux_paths = [
+        "/usr/bin/pdftoppm",
+        "/usr/local/bin/pdftoppm",
+        "/snap/bin/pdftoppm",
+        "/bin/pdftoppm",
+    ]
+    for path in linux_paths:
+        if os.path.exists(path):
+            return os.path.dirname(path)
+
+    # 3. Lokasi umum macOS
+    mac_paths = [
+        "/opt/homebrew/bin/pdftoppm",    # Apple Silicon
+        "/usr/local/bin/pdftoppm",       # Intel Mac
+    ]
+    for path in mac_paths:
+        if os.path.exists(path):
+            return os.path.dirname(path)
+
+    # 4. Jika semuanya gagal, pakai default
+    return POPPLER_PATH
+
+
 # Verify tools exist
 def verify_tools():
     """Check if all tools are available"""
-    global GHOSTSCRIPT_PATH
+    global GHOSTSCRIPT_PATH, POPPLER_PATH, PDFTOPPM_PATH
+    
     GHOSTSCRIPT_PATH = detect_ghostscript()
+    POPPLER_PATH = detect_poppler()
+    PDFTOPPM_PATH = os.path.join(POPPLER_PATH, "pdftoppm")
 
     tools = {
         "Ghostscript": GHOSTSCRIPT_PATH,
         "LibreOffice": LIBREOFFICE_PATH,
         "Tesseract": TESSERACT_PATH,
+        "Poppler (pdftoppm)": PDFTOPPM_PATH,
     }
     
     missing = []

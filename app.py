@@ -15,7 +15,7 @@ import json
 import subprocess
 from dotenv import load_dotenv
 from tasks import ocr_task
-from tools_config import GHOSTSCRIPT_PATH, LIBREOFFICE_PATH
+from tools_config import GHOSTSCRIPT_PATH, LIBREOFFICE_PATH, POPPLER_PATH
 
 app = Flask(__name__)
 
@@ -660,6 +660,7 @@ def ocr_pdf():
             return jsonify({'error': 'File harus berformat PDF', 'status': 'failed'}), 400
 
         pdf_password = request.form.get('password', None)
+        letter_id = request.form.get('letter_id')
 
         # Save input PDF
         original_filename = secure_filename(file.filename)
@@ -667,25 +668,45 @@ def ocr_pdf():
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
         file.save(file_path)
 
-        file_size = os.path.getsize(file_path)
-
-        letter_id = request.form.get('letter_id')
-
-        # Total pages
-        reader = PyPDF2.PdfReader(file_path)
-        total_pages = len(reader.pages)
-
-        # INSERT → documents
-        document_id = create_documents_entry(
-            original_filename,
-            file_path,
-            ".pdf",
-            file_size,
-            total_pages
-        )
-
-        # INSERT → ocr_files
-        ocr_id = create_ocr_entry(document_id)
+        # Quick validation
+        try:
+            reader = PyPDF2.PdfReader(file_path)
+            
+            # Handle encryption early
+            if reader.is_encrypted:
+                decrypted = False
+                try_passwords = []
+                if pdf_password:
+                    try_passwords.append(pdf_password)
+                try_passwords.append("")
+                
+                for pw in try_passwords:
+                    try:
+                        res = reader.decrypt(pw)
+                        if res == 1 or res is True:
+                            decrypted = True
+                            break
+                    except:
+                        pass
+                
+                if not decrypted:
+                    # Clean up file
+                    os.remove(file_path)
+                    return jsonify({
+                        'error': 'PDF terenkripsi. Tambahkan password yang benar.', 
+                        'status': 'failed'
+                    }), 400
+            
+            total_pages = len(reader.pages)
+            
+        except Exception as e:
+            # Clean up file
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return jsonify({
+                'error': f'File PDF tidak valid atau rusak: {str(e)}', 
+                'status': 'failed'
+            }), 400
 
         # Prepare OCR output folder
         ocr_folder = os.path.join(os.getcwd(), "ocr_results")
@@ -695,93 +716,72 @@ def ocr_pdf():
         ocr_filename = f"{uuid.uuid4().hex}_ocr.txt"
         ocr_output_path = os.path.join(ocr_folder, ocr_filename)
 
-        # Handle encryption
-        if reader.is_encrypted:
-            decrypted = False
-            try_passwords = []
-            if pdf_password:
-                try_passwords.append(pdf_password)
-            try_passwords.append("")
-            for pw in try_passwords:
-                try:
-                    res = reader.decrypt(pw)
-                    if res == 1 or res is True:
-                        decrypted = True
-                        break
-                except:
-                    pass
-            if not decrypted:
-                update_ocr_status(ocr_id, "failed")
-                return jsonify({'error': 'PDF terenkripsi. Tambahkan password.', 'status': 'failed'}), 400
+        # Generate unique task ID for tracking
+        task_id = uuid.uuid4().hex
 
-        # Convert PDF → Images
-        pages = convert_from_path(
-            file_path,
-            dpi=300,
-            fmt="png",
-            userpw=pdf_password if pdf_password else None,
-            poppler_path="/usr/bin"
-        )
-
-        # OCR process
-        ocr_lang = "eng+ind"
-        full_text = ""
-        text_by_page = []
-
-        for page_num, img in enumerate(pages, start=1):
-            try:
-                page_text = pytesseract.image_to_string(img, lang=ocr_lang)
-
-                # Simpan ke list untuk response
-                text_by_page.append({"page": page_num, "text": page_text})
-
-                full_text += f"\n\n===== PAGE {page_num} =====\n{page_text}\n"
-
-                # ⬅ INSERT ke database: 1 baris per halaman
-                insert_ocr_page(document_id, page_num, page_text)
-
-            except Exception as e_page:
-                text_by_page.append({"page": page_num, "text": f"ERROR: {e_page}"})
-
-                # tetap insert agar halaman ada record
-                insert_ocr_page(document_id, page_num, f"ERROR: {e_page}")
-
-        # Save extracted text
-        with open(ocr_output_path, "w", encoding="utf-8") as f:
-            f.write(full_text)
-
-        # Update DB
-        update_ocr_status(ocr_id, "completed", full_text)
-
-        # Kirim ke Celery
-        task = ocr_and_compress_task.delay(
-            document_id=document_id,
+        # Kirim ke Celery untuk diproses secara asynchronous
+        task = ocr_task.delay(
             file_path=file_path,
             pdf_password=pdf_password,
+            ocr_output_path=ocr_output_path,
             callback_data={
                 "letter_id": letter_id,
                 "download_url": f"{BASE_URL}/download/ocr/{ocr_filename}"
             }
         )
 
-        # Return JSON
+        # Return immediately - processing akan dilakukan di background
         return jsonify({
-            "status": "success",
-            "message": "OCR completed",
-            "document_id": document_id,
-            "ocr_id": ocr_id,
-            "output_text_path": ocr_output_path,
+            "status": "processing",
+            "message": "OCR sedang diproses secara asynchronous",
+            "task_id": task.id,
+            "tracking_id": task_id,
+            "filename": original_filename,
             "download_url": f"{BASE_URL}/download/ocr/{ocr_filename}",
-            "pages": len(pages),
-            "text_by_page": text_by_page
-        })
+            "total_pages": total_pages,
+            "letter_id": letter_id
+        }), 202  # 202 Accepted
 
     except Exception as e:
-        try:
-            update_ocr_status(ocr_id, "failed")
-        except:
-            pass
         return jsonify({'error': str(e), 'status': 'failed'}), 500
+
+@app.route('/docs/api/tools/ocr/status/<int:ocr_id>', methods=['GET'])
+def ocr_status(ocr_id):
+    """Check OCR task status using Celery task ID"""
+    from celery.result import AsyncResult
+    
+    task = AsyncResult(task_id, app=celery)
+    
+    if task.state == 'PENDING':
+        response = {
+            'status': 'pending',
+            'message': 'Task is waiting to be processed'
+        }
+    elif task.state == 'PROCESSING':
+        response = {
+            'status': 'processing',
+            'message': 'OCR is being processed'
+        }
+    elif task.state == 'SUCCESS':
+        response = {
+            'status': 'completed',
+            'message': 'OCR completed successfully',
+            'result': task.result
+        }
+    elif task.state == 'FAILURE':
+        response = {
+            'status': 'failed',
+            'message': 'OCR failed',
+            'error': str(task.info)
+        }
+    else:
+        response = {
+            'status': task.state,
+            'message': 'Unknown status'
+        }
+    
+    return jsonify(response)
+
 
 @app.route('/docs/api/tools/ocr-async', methods=['POST'])
 def ocr_async():
@@ -944,7 +944,7 @@ def choose_gs_profile(file_path):
         return "/ebook"    # tetap medium compression
 
     else:
-        return "/screen"   # >1MB: lebih agresif
+        return "/ebook"   # >1MB: lebih agresif
 
 # ==================== COMPRESS PDF ENDPOINT ====================
 @app.route('/docs/api/tools/compress-pdf', methods=['POST'])
@@ -975,31 +975,54 @@ def compress_pdf():
         compressed_name = f"{uuid.uuid4().hex}_compressed.pdf"
         output_path = os.path.join(app.config["COMPRESSED_FOLDER"], compressed_name)
 
-        # Ghostscript command (high compression)
-        profile = choose_gs_profile(input_path)
+        # Cek ukuran file original
+        original_size = os.path.getsize(input_path)
+
+        # Tentukan profile dan settings berdasarkan ukuran file
+        # Untuk file scan (biasanya lebih besar), gunakan settings lebih konservatif
+        if original_size > 5 * 1024 * 1024:  # > 5MB, kemungkinan scan
+            profile = "/ebook"
+            resolution = 150
+            jpeg_quality = 75
+        elif original_size > 2 * 1024 * 1024:  # > 2MB
+            profile = "/ebook"
+            resolution = 120
+            jpeg_quality = 70
+        else:  # File kecil (digital text)
+            profile = "/ebook"
+            resolution = 100
+            jpeg_quality = 65
+
+        # Ghostscript command dengan settings yang lebih aman untuk scan
         gs_command = [
             GHOSTSCRIPT_PATH,
             "-sDEVICE=pdfwrite",
             "-dCompatibilityLevel=1.4",
-            f"-dPDFSETTINGS={profile}",   # /screen = kecil sekali, /ebook = balanced, /prepress = high quality
+            f"-dPDFSETTINGS={profile}",
+            
+            # Downsample dengan bicubic (lebih baik untuk scan)
+            "-dColorImageDownsampleType=/Bicubic",
+            f"-dColorImageResolution={resolution}",
+            "-dGrayImageDownsampleType=/Bicubic",
+            f"-dGrayImageResolution={resolution}",
+            "-dMonoImageDownsampleType=/Bicubic",
+            f"-dMonoImageResolution={resolution}",
 
-            # Downsample gambar
-            "-dColorImageDownsampleType=/Average",
-            "-dColorImageResolution=72",
-            "-dGrayImageDownsampleType=/Average",
-            "-dGrayImageResolution=72",
-            "-dMonoImageDownsampleType=/Subsample",
-            "-dMonoImageResolution=72",
-
-            # JPEG compression
+            # JPEG compression dengan quality lebih tinggi
             "-dAutoFilterColorImages=false",
             "-dAutoFilterGrayImages=false",
             "-dColorImageFilter=/DCTEncode",
             "-dGrayImageFilter=/DCTEncode",
 
-            # Quality JPEG (0.1 = sangat kecil, 0.4 = sedang)
-            "-dJPEGQ=40",
+            # JPEG Quality lebih tinggi untuk scan
+            f"-dJPEGQ={jpeg_quality}",
 
+            # Preserve metadata dan struktur
+            "-dPreserveAnnots=true",
+            "-dPreserveEPSInfo=false",
+            "-dPreserveOPIComments=false",
+            "-dPreserveOverprintSettings=false",
+            
             "-dNOPAUSE",
             "-dQUIET",
             "-dBATCH",
@@ -1018,11 +1041,45 @@ def compress_pdf():
                 "detail": result.stderr.decode()
             }), 500
 
-        # Cek file size
-        original_size = os.path.getsize(input_path)
+        # Validasi file hasil kompresi
+        if not os.path.exists(output_path):
+            return jsonify({
+                "status": "failed",
+                "error": "File hasil kompresi tidak ditemukan"
+            }), 500
+
         compressed_size = os.path.getsize(output_path)
 
+        # Cek jika file terlalu kecil (kemungkinan rusak)
+        # File PDF minimal sekitar 1KB, jika dibawah itu pasti rusak
+        if compressed_size < 1024:  # Kurang dari 1KB
+            os.remove(output_path)  # Hapus file rusak
+            return jsonify({
+                "status": "failed",
+                "error": "Kompresi menghasilkan file yang rusak. Coba dengan file PDF lain atau gunakan settingan berbeda."
+            }), 500
+
+        # Cek jika kompresi terlalu agresif (> 95% reduction bisa indikasi masalah)
         reduction_percent = 100 - ((compressed_size / original_size) * 100)
+        
+        if reduction_percent > 95:
+            os.remove(output_path)  # Hapus file yang kemungkinan rusak
+            return jsonify({
+                "status": "failed",
+                "error": "Kompresi terlalu agresif dan kemungkinan merusak file. File original mungkin sudah optimal atau memiliki format khusus."
+            }), 500
+
+        # Jika kompresi malah memperbesar file (bisa terjadi pada file sudah optimal)
+        if compressed_size >= original_size:
+            os.remove(output_path)  # Hapus file hasil
+            return jsonify({
+                "status": "success",
+                "message": "File PDF sudah optimal, tidak perlu dikompres",
+                "original_size": original_size,
+                "compressed_size": original_size,
+                "reduction_percent": 0,
+                "note": "File original dikembalikan karena sudah dalam ukuran optimal"
+            })
 
         return jsonify({
             "status": "success",
