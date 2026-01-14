@@ -644,8 +644,7 @@ def send_callback_to_sirama(letter_id, full_text, compressed_url):
 @app.route('/docs/api/tools/ocr', methods=['POST'])
 def ocr_pdf():
     """
-    Endpoint OCR PDF (Bahasa Inggris + Indonesia)
-    Optional form field: password (untuk PDF terenkripsi)
+    Endpoint OCR PDF (Asynchronous with Celery + Database)
     """
     try:
         if 'file' not in request.files:
@@ -690,7 +689,6 @@ def ocr_pdf():
                         pass
                 
                 if not decrypted:
-                    # Clean up file
                     os.remove(file_path)
                     return jsonify({
                         'error': 'PDF terenkripsi. Tambahkan password yang benar.', 
@@ -700,7 +698,6 @@ def ocr_pdf():
             total_pages = len(reader.pages)
             
         except Exception as e:
-            # Clean up file
             if os.path.exists(file_path):
                 os.remove(file_path)
             return jsonify({
@@ -708,19 +705,32 @@ def ocr_pdf():
                 'status': 'failed'
             }), 400
 
-        # Prepare OCR output folder
+        file_size = os.path.getsize(file_path)
+
+        # 1. CREATE DOCUMENT ENTRY
+        document_id = create_documents_entry(
+            original_filename,
+            file_path,
+            ".pdf",
+            file_size,
+            total_pages
+        )
+
+        # 2. CREATE OCR ENTRY (status: processing)
+        ocr_id = create_ocr_entry(document_id)
+
+        # 3. GENERATE OUTPUT PATH
         ocr_folder = os.path.join(os.getcwd(), "ocr_results")
         os.makedirs(ocr_folder, exist_ok=True)
-
-        # Generate result filename
         ocr_filename = f"{uuid.uuid4().hex}_ocr.txt"
         ocr_output_path = os.path.join(ocr_folder, ocr_filename)
 
-        # Generate unique task ID for tracking
-        task_id = uuid.uuid4().hex
-
-        # Kirim ke Celery untuk diproses secara asynchronous
-        task = ocr_task.delay(
+        # 4. QUEUE TO CELERY
+        from tasks import ocr_task_with_db
+        
+        task = ocr_task_with_db.delay(
+            document_id=document_id,
+            ocr_id=ocr_id,
             file_path=file_path,
             pdf_password=pdf_password,
             ocr_output_path=ocr_output_path,
@@ -730,58 +740,77 @@ def ocr_pdf():
             }
         )
 
-        # Return immediately - processing akan dilakukan di background
+        # 5. RETURN IMMEDIATELY
         return jsonify({
             "status": "processing",
             "message": "OCR sedang diproses secara asynchronous",
             "task_id": task.id,
-            "tracking_id": task_id,
+            "document_id": document_id,
+            "ocr_id": ocr_id,
             "filename": original_filename,
             "download_url": f"{BASE_URL}/download/ocr/{ocr_filename}",
             "total_pages": total_pages,
-            "letter_id": letter_id
+            "letter_id": letter_id,
+            "check_status_url": f"{BASE_URL}/docs/api/tools/ocr/status/{ocr_id}"
         }), 202  # 202 Accepted
 
     except Exception as e:
         return jsonify({'error': str(e), 'status': 'failed'}), 500
 
+
 @app.route('/docs/api/tools/ocr/status/<int:ocr_id>', methods=['GET'])
 def ocr_status(ocr_id):
-    """Check OCR task status using Celery task ID"""
-    from celery.result import AsyncResult
-    
-    task = AsyncResult(task_id, app=celery)
-    
-    if task.state == 'PENDING':
+    """
+    Check OCR status dari database
+    """
+    try:
+        connection = get_db_connection()
+        if not connection:
+            return jsonify({'error': 'Database connection failed', 'status': 'failed'}), 500
+            
+        cursor = connection.cursor(dictionary=True)
+        
+        # Get OCR record
+        query = """
+            SELECT o.*, d.file_name, d.total_page, d.size 
+            FROM ocr_files o
+            JOIN documents d ON o.document_id = d.id
+            WHERE o.id = %s
+        """
+        cursor.execute(query, (ocr_id,))
+        result = cursor.fetchone()
+        
+        cursor.close()
+        connection.close()
+        
+        if not result:
+            return jsonify({'error': 'OCR record not found', 'status': 'failed'}), 404
+        
+        # Format response
         response = {
-            'status': 'pending',
-            'message': 'Task is waiting to be processed'
+            'status': result['status'],
+            'ocr_id': result['id'],
+            'document_id': result['document_id'],
+            'filename': result['file_name'],
+            'total_pages': result['total_page'],
+            'created_at': result['created_at'].isoformat() if result['created_at'] else None,
+            'updated_at': result['updated_at'].isoformat() if result['updated_at'] else None
         }
-    elif task.state == 'PROCESSING':
-        response = {
-            'status': 'processing',
-            'message': 'OCR is being processed'
-        }
-    elif task.state == 'SUCCESS':
-        response = {
-            'status': 'completed',
-            'message': 'OCR completed successfully',
-            'result': task.result
-        }
-    elif task.state == 'FAILURE':
-        response = {
-            'status': 'failed',
-            'message': 'OCR failed',
-            'error': str(task.info)
-        }
-    else:
-        response = {
-            'status': task.state,
-            'message': 'Unknown status'
-        }
-    
-    return jsonify(response)
-
+        
+        # Add extracted text if completed
+        if result['status'] == 'completed' and result['extracted_text']:
+            response['extracted_text'] = result['extracted_text']
+            response['text_length'] = len(result['extracted_text'])
+            response['preview'] = result['extracted_text'][:500] + '...' if len(result['extracted_text']) > 500 else result['extracted_text']
+        
+        # Add error if failed
+        if result['status'] == 'failed':
+            response['error'] = result.get('extracted_text', 'Unknown error')
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e), 'status': 'failed'}), 500
 
 @app.route('/docs/api/tools/ocr-async', methods=['POST'])
 def ocr_async():
@@ -879,45 +908,559 @@ def ocr_async():
             'error': str(e)
         }), 500
 
+@app.route('/docs/api/tools/simple-ocr', methods=['POST'])
+def simple_ocr():
+    """
+    Endpoint OCR PDF sederhana tanpa database
+    Support: Digital text PDF & Scanned PDF
+    Return: Extracted text langsung
+    """
+    try:
+        # Validasi file upload
+        if 'file' not in request.files:
+            return jsonify({
+                'error': 'Tidak ada file yang diupload',
+                'status': 'failed'
+            }), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({
+                'error': 'Tidak ada file yang dipilih',
+                'status': 'failed'
+            }), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({
+                'error': 'File harus berformat PDF',
+                'status': 'failed'
+            }), 400
+
+        # Optional: Password untuk PDF terenkripsi
+        pdf_password = request.form.get('password', None)
+
+        # Save temporary file
+        original_filename = secure_filename(file.filename)
+        temp_id = f"temp_ocr_{uuid.uuid4().hex}_{original_filename}"
+        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_id)
+        file.save(temp_path)
+
+        try:
+            # Baca PDF
+            reader = PyPDF2.PdfReader(temp_path)
+            
+            # Handle encryption
+            if reader.is_encrypted:
+                decrypted = False
+                try_passwords = [pdf_password] if pdf_password else []
+                try_passwords.append("")  # Try empty password
+                
+                for pw in try_passwords:
+                    try:
+                        res = reader.decrypt(pw)
+                        if res == 1 or res is True:
+                            decrypted = True
+                            break
+                    except:
+                        pass
+                
+                if not decrypted:
+                    os.remove(temp_path)
+                    return jsonify({
+                        'error': 'PDF terenkripsi. Gunakan parameter "password"',
+                        'status': 'failed'
+                    }), 400
+            
+            total_pages = len(reader.pages)
+            
+            # Check apakah PDF punya text yang bisa di-extract (digital text)
+            has_extractable_text = False
+            digital_text = ""
+            
+            print(f"📄 Checking {total_pages} pages for extractable text...")
+            
+            for page_num, page in enumerate(reader.pages, start=1):
+                try:
+                    page_text = page.extract_text()
+                    if page_text and page_text.strip():
+                        has_extractable_text = True
+                        digital_text += f"\n\n===== PAGE {page_num} =====\n{page_text.strip()}\n"
+                except:
+                    pass
+            
+            # Tentukan metode OCR
+            if has_extractable_text:
+                # PDF Digital Text - sudah ada text
+                print(f"✓ PDF memiliki digital text - menggunakan PyPDF2 extraction")
+                
+                result = {
+                    'status': 'success',
+                    'message': 'Text extraction completed (Digital PDF)',
+                    'method': 'digital_extraction',
+                    'filename': original_filename,
+                    'total_pages': total_pages,
+                    'total_characters': len(digital_text),
+                    'extracted_text': digital_text.strip(),
+                    'has_copy_protection': False
+                }
+                
+            else:
+                # PDF Scan - perlu OCR dengan Tesseract
+                print(f"🔒 PDF tidak punya text atau protected - menggunakan Tesseract OCR")
+                
+                # Convert PDF to images
+                print(f"🖼️  Converting PDF to images (DPI: 300)...")
+                pages = convert_from_path(
+                    temp_path,
+                    dpi=300,
+                    fmt="png",
+                    userpw=pdf_password if pdf_password else None,
+                    poppler_path=POPPLER_PATH if POPPLER_PATH else None
+                )
+                
+                # OCR with Tesseract
+                ocr_lang = "eng+ind"  # English + Indonesian
+                full_text = ""
+                
+                print(f"🔍 Processing {len(pages)} pages with Tesseract OCR...")
+                
+                for page_num, img in enumerate(pages, start=1):
+                    try:
+                        # OCR per page
+                        page_text = pytesseract.image_to_string(img, lang=ocr_lang)
+                        page_text = page_text.strip()
+                        
+                        if page_text:
+                            full_text += f"\n\n===== PAGE {page_num} =====\n{page_text}\n"
+                            print(f"✓ Page {page_num}/{len(pages)} - {len(page_text)} characters")
+                        else:
+                            print(f"⚠️  Page {page_num}/{len(pages)} - No text detected")
+                            full_text += f"\n\n===== PAGE {page_num} =====\n[No text detected]\n"
+                        
+                    except Exception as e_page:
+                        error_msg = f"Error: {str(e_page)}"
+                        print(f"✗ Page {page_num}/{len(pages)} failed: {error_msg}")
+                        full_text += f"\n\n===== PAGE {page_num} =====\n{error_msg}\n"
+                
+                result = {
+                    'status': 'success',
+                    'message': 'OCR completed (Scanned PDF)',
+                    'method': 'tesseract_ocr',
+                    'filename': original_filename,
+                    'total_pages': total_pages,
+                    'total_characters': len(full_text),
+                    'extracted_text': full_text.strip(),
+                    'has_copy_protection': True
+                }
+            
+            # Cleanup temporary file
+            os.remove(temp_path)
+            
+            print(f"✅ OCR Success: {result['total_characters']} characters extracted")
+            
+            return jsonify(result), 200
+            
+        except Exception as e:
+            # Cleanup on error
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+            
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'status': 'failed'
+        }), 500
+
+
+# Optional: Endpoint untuk save hasil OCR ke file
+@app.route('/docs/api/tools/simple-ocr-save', methods=['POST'])
+def simple_ocr_save():
+    """
+    OCR PDF dan simpan hasil ke file .txt
+    """
+    try:
+        # Validasi file upload
+        if 'file' not in request.files:
+            return jsonify({
+                'error': 'Tidak ada file yang diupload',
+                'status': 'failed'
+            }), 400
+
+        file = request.files['file']
+
+        if file.filename == '':
+            return jsonify({
+                'error': 'Tidak ada file yang dipilih',
+                'status': 'failed'
+            }), 400
+
+        if not allowed_file(file.filename):
+            return jsonify({
+                'error': 'File harus berformat PDF',
+                'status': 'failed'
+            }), 400
+
+        pdf_password = request.form.get('password', None)
+
+        # Save temporary file
+        original_filename = secure_filename(file.filename)
+        temp_id = f"temp_ocr_{uuid.uuid4().hex}_{original_filename}"
+        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], temp_id)
+        file.save(temp_path)
+
+        try:
+            reader = PyPDF2.PdfReader(temp_path)
+            
+            # Handle encryption
+            if reader.is_encrypted:
+                decrypted = False
+                try_passwords = [pdf_password] if pdf_password else []
+                try_passwords.append("")
+                
+                for pw in try_passwords:
+                    try:
+                        res = reader.decrypt(pw)
+                        if res == 1 or res is True:
+                            decrypted = True
+                            break
+                    except:
+                        pass
+                
+                if not decrypted:
+                    os.remove(temp_path)
+                    return jsonify({
+                        'error': 'PDF terenkripsi. Gunakan parameter "password"',
+                        'status': 'failed'
+                    }), 400
+            
+            total_pages = len(reader.pages)
+            
+            # Check extractable text
+            has_extractable_text = False
+            extracted_text = ""
+            
+            for page_num, page in enumerate(reader.pages, start=1):
+                try:
+                    page_text = page.extract_text()
+                    if page_text and page_text.strip():
+                        has_extractable_text = True
+                        extracted_text += f"\n\n===== PAGE {page_num} =====\n{page_text.strip()}\n"
+                except:
+                    pass
+            
+            # If no extractable text, use OCR
+            if not has_extractable_text:
+                pages = convert_from_path(
+                    temp_path,
+                    dpi=300,
+                    fmt="png",
+                    userpw=pdf_password if pdf_password else None,
+                    poppler_path=POPPLER_PATH if POPPLER_PATH else None
+                )
+                
+                ocr_lang = "eng+ind"
+                extracted_text = ""
+                
+                for page_num, img in enumerate(pages, start=1):
+                    try:
+                        page_text = pytesseract.image_to_string(img, lang=ocr_lang)
+                        page_text = page_text.strip()
+                        extracted_text += f"\n\n===== PAGE {page_num} =====\n{page_text}\n"
+                    except Exception as e_page:
+                        extracted_text += f"\n\n===== PAGE {page_num} =====\nError: {str(e_page)}\n"
+            
+            # Save to file
+            output_filename = f"{uuid.uuid4().hex}_ocr.txt"
+            output_path = os.path.join(app.config['OUTPUT_OCR_FOLDER'], output_filename)
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(extracted_text.strip())
+            
+            # Cleanup temp file
+            os.remove(temp_path)
+            
+            return jsonify({
+                'status': 'success',
+                'message': 'OCR completed and saved to file',
+                'method': 'digital_extraction' if has_extractable_text else 'tesseract_ocr',
+                'filename': original_filename,
+                'total_pages': total_pages,
+                'total_characters': len(extracted_text),
+                'output_file': output_filename,
+                'download_url': f"{BASE_URL}/download/ocr/{output_filename}",
+                'has_copy_protection': not has_extractable_text
+            }), 200
+            
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+            
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'status': 'failed'
+        }), 500
 
 # Optional: Endpoint untuk check status task
+# Tambahkan endpoints ini ke app.py
+
 @app.route('/docs/api/tools/task-status/<task_id>', methods=['GET'])
-def check_task_status(task_id):
-    """Check status of Celery task"""
+def check_celery_task_status(task_id):
+    """
+    Check Celery task status (dari Celery backend)
+    """
     from celery.result import AsyncResult
     from tasks import celery
     
-    task = AsyncResult(task_id, app=celery)
-    
-    if task.state == 'PENDING':
+    try:
+        task = AsyncResult(task_id, app=celery)
+        
         response = {
-            'status': 'pending',
-            'message': 'Task is waiting to be executed'
+            'task_id': task_id,
+            'state': task.state,
+            'status': task.state.lower()
         }
-    elif task.state == 'STARTED':
+        
+        if task.state == 'PENDING':
+            response['message'] = 'Task sedang menunggu untuk diproses'
+            
+        elif task.state == 'STARTED':
+            response['message'] = 'Task sedang diproses'
+            response['status'] = 'processing'
+            
+        elif task.state == 'SUCCESS':
+            response['message'] = 'Task berhasil diselesaikan'
+            response['status'] = 'completed'
+            response['result'] = task.result
+            
+        elif task.state == 'FAILURE':
+            response['message'] = 'Task gagal'
+            response['status'] = 'failed'
+            response['error'] = str(task.info)
+            
+        elif task.state == 'RETRY':
+            response['message'] = 'Task sedang di-retry'
+            response['status'] = 'processing'
+            
+        else:
+            response['message'] = f'Status: {task.state}'
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'status': 'failed'
+        }), 500
+
+
+@app.route('/docs/api/tools/ocr/list', methods=['GET'])
+def list_ocr_files():
+    """
+    List semua OCR files dengan detail status
+    """
+    try:
+        connection = get_db_connection()
+        if not connection:
+            return jsonify({'error': 'Database connection failed', 'status': 'failed'}), 500
+            
+        cursor = connection.cursor(dictionary=True)
+        
+        # Join dengan documents table untuk info lengkap
+        query = """
+            SELECT 
+                o.id as ocr_id,
+                o.document_id,
+                o.status,
+                o.extracted_text,
+                o.metadata_file,
+                o.created_at,
+                o.updated_at,
+                d.file_name,
+                d.type,
+                d.size,
+                d.total_page,
+                d.file_path
+            FROM ocr_files o
+            JOIN documents d ON o.document_id = d.id
+            ORDER BY o.created_at DESC
+        """
+        
+        cursor.execute(query)
+        results = cursor.fetchall()
+        
+        # Format results
+        formatted_results = []
+        for row in results:
+            formatted_row = {
+                'ocr_id': row['ocr_id'],
+                'document_id': row['document_id'],
+                'filename': row['file_name'],
+                'status': row['status'],
+                'total_pages': row['total_page'],
+                'file_size': row['size'],
+                'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                'updated_at': row['updated_at'].isoformat() if row['updated_at'] else None
+            }
+            
+            # Add text preview jika ada
+            if row['extracted_text']:
+                text_length = len(row['extracted_text'])
+                formatted_row['text_length'] = text_length
+                formatted_row['text_preview'] = row['extracted_text'][:200] + '...' if text_length > 200 else row['extracted_text']
+            else:
+                formatted_row['text_length'] = 0
+                formatted_row['text_preview'] = None
+            
+            # Parse metadata if exists
+            if row['metadata_file']:
+                try:
+                    import json
+                    formatted_row['metadata'] = json.loads(row['metadata_file'])
+                except:
+                    formatted_row['metadata'] = None
+            
+            formatted_results.append(formatted_row)
+        
+        cursor.close()
+        connection.close()
+        
+        return jsonify({
+            'status': 'success',
+            'count': len(formatted_results),
+            'data': formatted_results
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'status': 'failed'
+        }), 500
+
+
+@app.route('/docs/api/tools/ocr/detail/<int:ocr_id>', methods=['GET'])
+def get_ocr_detail(ocr_id):
+    """
+    Get full OCR detail termasuk full extracted text
+    """
+    try:
+        connection = get_db_connection()
+        if not connection:
+            return jsonify({'error': 'Database connection failed', 'status': 'failed'}), 500
+            
+        cursor = connection.cursor(dictionary=True)
+        
+        query = """
+            SELECT 
+                o.*,
+                d.file_name,
+                d.type,
+                d.size,
+                d.total_page,
+                d.file_path,
+                d.upload_at
+            FROM ocr_files o
+            JOIN documents d ON o.document_id = d.id
+            WHERE o.id = %s
+        """
+        
+        cursor.execute(query, (ocr_id,))
+        result = cursor.fetchone()
+        
+        cursor.close()
+        connection.close()
+        
+        if not result:
+            return jsonify({
+                'error': 'OCR record not found',
+                'status': 'failed'
+            }), 404
+        
+        # Format full response with complete text
         response = {
-            'status': 'processing',
-            'message': 'Task is currently being processed'
+            'status': 'success',
+            'data': {
+                'ocr_id': result['id'],
+                'document_id': result['document_id'],
+                'filename': result['file_name'],
+                'file_type': result['type'],
+                'file_size': result['size'],
+                'total_pages': result['total_page'],
+                'ocr_status': result['status'],
+                'extracted_text': result['extracted_text'],
+                'text_length': len(result['extracted_text']) if result['extracted_text'] else 0,
+                'created_at': result['created_at'].isoformat() if result['created_at'] else None,
+                'updated_at': result['updated_at'].isoformat() if result['updated_at'] else None,
+                'upload_at': result['upload_at'].isoformat() if result['upload_at'] else None
+            }
         }
-    elif task.state == 'SUCCESS':
-        response = {
-            'status': 'completed',
-            'message': 'Task completed successfully',
-            'result': task.result
-        }
-    elif task.state == 'FAILURE':
-        response = {
-            'status': 'failed',
-            'message': 'Task failed',
-            'error': str(task.info)
-        }
-    else:
-        response = {
-            'status': task.state,
-            'message': 'Unknown task state'
-        }
-    
-    return jsonify(response)
+        
+        # Parse metadata
+        if result['metadata_file']:
+            try:
+                import json
+                response['data']['metadata'] = json.loads(result['metadata_file'])
+            except:
+                response['data']['metadata'] = None
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'status': 'failed'
+        }), 500
+
+
+@app.route('/docs/api/tools/ocr/stats', methods=['GET'])
+def get_ocr_stats():
+    """
+    Get OCR processing statistics
+    """
+    try:
+        connection = get_db_connection()
+        if not connection:
+            return jsonify({'error': 'Database connection failed', 'status': 'failed'}), 500
+            
+        cursor = connection.cursor(dictionary=True)
+        
+        # Get statistics
+        stats_query = """
+            SELECT 
+                COUNT(*) as total_files,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as processing,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending
+            FROM ocr_files
+        """
+        
+        cursor.execute(stats_query)
+        stats = cursor.fetchone()
+        
+        cursor.close()
+        connection.close()
+        
+        return jsonify({
+            'status': 'success',
+            'statistics': {
+                'total_files': stats['total_files'] or 0,
+                'completed': stats['completed'] or 0,
+                'processing': stats['processing'] or 0,
+                'failed': stats['failed'] or 0,
+                'pending': stats['pending'] or 0,
+                'success_rate': round((stats['completed'] / stats['total_files'] * 100), 2) if stats['total_files'] > 0 else 0
+            }
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'status': 'failed'
+        }), 500
 
 def is_pdf_broken(path):
     """
@@ -1136,37 +1679,6 @@ def get_compress_info(file_id):
             'status': 'failed'
         }), 404
 
-@app.route('/docs/api/tools/ocr/list', methods=['GET'])
-def list_ocr_files():
-    """Endpoint untuk mendapatkan semua file OCR dari database"""
-    try:
-        connection = get_db_connection()
-        if connection:
-            cursor = connection.cursor(dictionary=True)
-            cursor.execute("SELECT * FROM ocr_files ORDER BY created_at DESC")
-            results = cursor.fetchall()
-            
-            # Konversi datetime ke string
-            for result in results:
-                result['upload_time'] = result['upload_time'].isoformat() if result['upload_time'] else None
-                result['created_at'] = result['created_at'].isoformat() if result['created_at'] else None
-                result['updated_at'] = result['updated_at'].isoformat() if result['updated_at'] else None
-                # Hapus text yang panjang dari list view
-                result['extracted_text'] = result['extracted_text'][:200] + '...' if result['extracted_text'] and len(result['extracted_text']) > 200 else result['extracted_text']
-            
-            cursor.close()
-            connection.close()
-            
-            return jsonify({
-                'status': 'success',
-                'count': len(results),
-                'data': results
-            }), 200
-    except Error as e:
-        return jsonify({
-            'error': f'Database error: {str(e)}',
-            'status': 'failed'
-        }), 500
 
 @app.route('/docs/api/tools/compress/list', methods=['GET'])
 def list_compress_files():
@@ -1843,6 +2355,296 @@ def swagger_json():
                     "responses": {
                         "200": {
                             "description": "OCR berhasil dan tersimpan di database"
+                        }
+                    }
+                }
+            },
+            # ==================== SIMPLE OCR ENDPOINTS (NEW) ====================
+            "/docs/api/tools/simple-ocr": {
+                "post": {
+                    "summary": "Simple OCR - Extract Text (No Database)",
+                    "description": """
+                    Extract text dari PDF tanpa menyimpan ke database.
+                    
+                    **Features:**
+                    - Auto-detect: Digital text PDF atau Scanned PDF
+                    - Support password-protected PDF
+                    - Dual language: English + Indonesian
+                    - Return hasil langsung dalam JSON
+                    
+                    **Performance:**
+                    - Digital PDF: ~1-2 seconds
+                    - Scanned PDF: ~5-30 seconds (depends on pages)
+                    
+                    **Method Detection:**
+                    - `digital_extraction`: PDF dengan text yang bisa di-copy (fast)
+                    - `tesseract_ocr`: PDF hasil scan/protected (slower, uses OCR)
+                    """,
+                    "tags": ["Simple OCR (No Database)"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file": {
+                                            "type": "string",
+                                            "format": "binary",
+                                            "description": "PDF file untuk ekstraksi text"
+                                        },
+                                        "password": {
+                                            "type": "string",
+                                            "description": "Password untuk PDF terenkripsi (optional)"
+                                        }
+                                    },
+                                    "required": ["file"]
+                                },
+                                "examples": {
+                                    "digital_pdf": {
+                                        "summary": "Digital PDF (no password)",
+                                        "value": {
+                                            "file": "document.pdf"
+                                        }
+                                    },
+                                    "protected_pdf": {
+                                        "summary": "Password-protected PDF",
+                                        "value": {
+                                            "file": "protected.pdf",
+                                            "password": "mypassword"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Text extraction successful",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {
+                                                "type": "string",
+                                                "example": "success"
+                                            },
+                                            "message": {
+                                                "type": "string",
+                                                "example": "Text extraction completed (Digital PDF)"
+                                            },
+                                            "method": {
+                                                "type": "string",
+                                                "enum": ["digital_extraction", "tesseract_ocr"],
+                                                "example": "digital_extraction"
+                                            },
+                                            "filename": {
+                                                "type": "string",
+                                                "example": "document.pdf"
+                                            },
+                                            "total_pages": {
+                                                "type": "integer",
+                                                "example": 5
+                                            },
+                                            "total_characters": {
+                                                "type": "integer",
+                                                "example": 2856
+                                            },
+                                            "has_copy_protection": {
+                                                "type": "boolean",
+                                                "example": False
+                                            },
+                                            "extracted_text": {
+                                                "type": "string",
+                                                "example": "\n\n===== PAGE 1 =====\nThis is the content...\n\n===== PAGE 2 =====\nMore content..."
+                                            }
+                                        }
+                                    },
+                                    "examples": {
+                                        "digital_pdf": {
+                                            "summary": "Digital PDF Response",
+                                            "value": {
+                                                "status": "success",
+                                                "message": "Text extraction completed (Digital PDF)",
+                                                "method": "digital_extraction",
+                                                "filename": "document.pdf",
+                                                "total_pages": 5,
+                                                "total_characters": 2856,
+                                                "has_copy_protection": False,
+                                                "extracted_text": "\n\n===== PAGE 1 =====\nChapter 1: Introduction..."
+                                            }
+                                        },
+                                        "scanned_pdf": {
+                                            "summary": "Scanned PDF Response",
+                                            "value": {
+                                                "status": "success",
+                                                "message": "OCR completed (Scanned PDF)",
+                                                "method": "tesseract_ocr",
+                                                "filename": "scanned.pdf",
+                                                "total_pages": 3,
+                                                "total_characters": 1523,
+                                                "has_copy_protection": True,
+                                                "extracted_text": "\n\n===== PAGE 1 =====\nText from OCR..."
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "error": {"type": "string"},
+                                            "status": {"type": "string"}
+                                        }
+                                    },
+                                    "examples": {
+                                        "no_file": {
+                                            "summary": "No file uploaded",
+                                            "value": {
+                                                "error": "Tidak ada file yang diupload",
+                                                "status": "failed"
+                                            }
+                                        },
+                                        "encrypted": {
+                                            "summary": "Encrypted PDF without password",
+                                            "value": {
+                                                "error": "PDF terenkripsi. Gunakan parameter \"password\"",
+                                                "status": "failed"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "500": {
+                            "description": "Internal Server Error",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "error": {"type": "string"},
+                                            "status": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/docs/api/tools/simple-ocr-save": {
+                "post": {
+                    "summary": "Simple OCR - Save to File",
+                    "description": """
+                    Extract text dari PDF dan simpan ke file .txt, return download URL.
+                    
+                    **Features:**
+                    - Same as simple-ocr endpoint
+                    - Saves extracted text to .txt file
+                    - Returns download URL
+                    - File stored in ocr_results/ folder
+                    
+                    **Use Cases:**
+                    - When you need to download the text file
+                    - Batch processing
+                    - Archive extracted text
+                    """,
+                    "tags": ["Simple OCR (No Database)"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "multipart/form-data": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "file": {
+                                            "type": "string",
+                                            "format": "binary",
+                                            "description": "PDF file untuk ekstraksi text"
+                                        },
+                                        "password": {
+                                            "type": "string",
+                                            "description": "Password untuk PDF terenkripsi (optional)"
+                                        }
+                                    },
+                                    "required": ["file"]
+                                }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Text extraction successful and file saved",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "status": {
+                                                "type": "string",
+                                                "example": "success"
+                                            },
+                                            "message": {
+                                                "type": "string",
+                                                "example": "OCR completed and saved to file"
+                                            },
+                                            "method": {
+                                                "type": "string",
+                                                "enum": ["digital_extraction", "tesseract_ocr"],
+                                                "example": "digital_extraction"
+                                            },
+                                            "filename": {
+                                                "type": "string",
+                                                "example": "document.pdf"
+                                            },
+                                            "total_pages": {
+                                                "type": "integer",
+                                                "example": 5
+                                            },
+                                            "total_characters": {
+                                                "type": "integer",
+                                                "example": 2856
+                                            },
+                                            "output_file": {
+                                                "type": "string",
+                                                "example": "abc123_ocr.txt"
+                                            },
+                                            "download_url": {
+                                                "type": "string",
+                                                "example": "http://localhost:5001/download/ocr/abc123_ocr.txt"
+                                            },
+                                            "has_copy_protection": {
+                                                "type": "boolean",
+                                                "example": False
+                                            }
+                                        }
+                                    },
+                                    "example": {
+                                        "status": "success",
+                                        "message": "OCR completed and saved to file",
+                                        "method": "digital_extraction",
+                                        "filename": "document.pdf",
+                                        "total_pages": 5,
+                                        "total_characters": 2856,
+                                        "output_file": "abc123_ocr.txt",
+                                        "download_url": "http://localhost:5001/download/ocr/abc123_ocr.txt",
+                                        "has_copy_protection": False
+                                    }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Bad Request - lihat examples di endpoint simple-ocr"
+                        },
+                        "500": {
+                            "description": "Internal Server Error"
                         }
                     }
                 }

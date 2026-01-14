@@ -3,6 +3,9 @@ import os, PyPDF2, pytesseract
 from pdf2image import convert_from_path
 import requests
 from dotenv import load_dotenv
+import mysql.connector
+from mysql.connector import Error
+from datetime import datetime
 
 load_dotenv()
 
@@ -12,17 +15,93 @@ celery = make_celery()
 POPPLER_PATH = os.getenv("POPPLER_PATH", None)
 
 
-@celery.task(name="tasks.ocr_task", bind=True, max_retries=3)
-def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
+def get_db_connection():
+    """Get database connection"""
+    try:
+        connection = mysql.connector.connect(
+            host=os.getenv('DB_HOST', '127.0.0.1'),
+            user=os.getenv('DB_USER', 'root'),
+            password=os.getenv('DB_PASS', ''),
+            database=os.getenv('DB_NAME', 'dokumi'),
+            port=int(os.getenv('DB_PORT', 3306)),
+            charset='utf8mb4',
+            use_unicode=True
+        )
+        return connection
+    except Error as e:
+        print(f"❌ Database connection error: {e}")
+        return None
+
+
+def update_ocr_status_in_task(ocr_id, status, extracted_text="", metadata_file=None):
+    """Update OCR status in database from Celery task"""
+    if not ocr_id:
+        return False
+
+    if extracted_text is None:
+        extracted_text = ""
+    
+    extracted_text = str(extracted_text)
+
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+            
+        cursor = conn.cursor()
+
+        if metadata_file is not None:
+            sql = """
+                UPDATE ocr_files
+                SET status=%s, extracted_text=%s, metadata_file=%s, updated_at=%s
+                WHERE id=%s
+            """
+            params = (status, extracted_text, metadata_file, datetime.now(), ocr_id)
+        else:
+            sql = """
+                UPDATE ocr_files
+                SET status=%s, extracted_text=%s, updated_at=%s
+                WHERE id=%s
+            """
+            params = (status, extracted_text, datetime.now(), ocr_id)
+
+        cursor.execute(sql, params)
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+        print(f"✅ Database updated - OCR ID: {ocr_id}, Status: {status}")
+        return True
+
+    except Error as e:
+        print(f"❌ Database update error: {e}")
+        try:
+            if cursor:
+                cursor.close()
+            if conn and conn.is_connected():
+                conn.close()
+        except:
+            pass
+        return False
+
+
+@celery.task(name="tasks.ocr_task_with_db", bind=True, max_retries=3)
+def ocr_task_with_db(self, document_id, ocr_id, file_path, pdf_password, ocr_output_path, callback_data):
     """
-    Async task untuk OCR PDF - tanpa database
+    Async task untuk OCR PDF dengan database update
     """
     try:
-        print(f"🔄 Starting OCR task for file: {file_path}")
+        print(f"📄 Starting OCR task - OCR ID: {ocr_id}, Document ID: {document_id}")
+        print(f"📂 File: {file_path}")
+        
+        # Update status to processing
+        update_ocr_status_in_task(ocr_id, "processing")
         
         # Validasi file exists
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File tidak ditemukan: {file_path}")
+            error_msg = f"File tidak ditemukan: {file_path}"
+            update_ocr_status_in_task(ocr_id, "failed", error_msg)
+            raise FileNotFoundError(error_msg)
 
         # Read PDF
         reader = PyPDF2.PdfReader(file_path)
@@ -46,9 +125,11 @@ def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
                     pass
             
             if not decrypted:
-                raise Exception("PDF terenkripsi dan password tidak valid")
+                error_msg = "PDF terenkripsi dan password tidak valid"
+                update_ocr_status_in_task(ocr_id, "failed", error_msg)
+                raise Exception(error_msg)
 
-        # Check if PDF has copy protection (image-only PDF)
+        # Check if PDF has copy protection
         has_extractable_text = False
         try:
             for page in reader.pages:
@@ -60,7 +141,7 @@ def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
             has_extractable_text = False
 
         if has_extractable_text:
-            print(f"ℹ️  PDF memiliki text yang bisa di-extract (tidak fully protected)")
+            print(f"ℹ️  PDF memiliki text yang bisa di-extract")
         else:
             print(f"🔒 PDF protected atau image-only, menggunakan OCR")
 
@@ -88,9 +169,8 @@ def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
                 # Clean up text
                 page_text = page_text.strip()
                 
-                print(f"✓ Page {page_num}/{len(pages)} processed - {len(page_text)} characters extracted")
+                print(f"✓ Page {page_num}/{len(pages)} processed - {len(page_text)} characters")
                 
-                # Simpan ke list untuk response
                 text_by_page.append({
                     "page": page_num,
                     "text": page_text,
@@ -116,6 +196,18 @@ def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
         with open(ocr_output_path, "w", encoding="utf-8") as f:
             f.write(full_text)
 
+        # ✅ UPDATE DATABASE WITH EXTRACTED TEXT
+        print(f"💾 Updating database with extracted text...")
+        update_success = update_ocr_status_in_task(
+            ocr_id, 
+            "completed", 
+            full_text,
+            metadata_file='{"has_protection": ' + str(not has_extractable_text).lower() + ', "total_pages": ' + str(len(pages)) + '}'
+        )
+        
+        if not update_success:
+            print(f"⚠️  Warning: Database update failed, but OCR completed")
+
         # Send callback to SIRAMA if letter_id provided
         if callback_data and callback_data.get("letter_id"):
             print(f"📤 Sending callback for letter_id: {callback_data.get('letter_id')}")
@@ -131,16 +223,21 @@ def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
         
         return {
             "status": "success",
+            "ocr_id": ocr_id,
+            "document_id": document_id,
             "pages_processed": len(pages),
             "has_copy_protection": not has_extractable_text,
             "output_file": ocr_output_path,
             "total_characters": len(full_text),
-            "text_by_page": text_by_page
+            "database_updated": update_success
         }
 
     except Exception as e:
         error_msg = str(e)
         print(f"❌ OCR task failed: {error_msg}")
+        
+        # Update database to failed
+        update_ocr_status_in_task(ocr_id, "failed", f"Error: {error_msg}")
         
         # Retry mechanism
         try:
@@ -148,6 +245,7 @@ def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
             raise self.retry(exc=e, countdown=60)
         except self.MaxRetriesExceededError:
             print(f"❌ Max retries exceeded")
+            
             # Send failed callback if applicable
             if callback_data and callback_data.get("letter_id"):
                 send_callback_failed(
@@ -157,8 +255,28 @@ def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
             
             return {
                 "status": "failed",
+                "ocr_id": ocr_id,
                 "error": error_msg
             }
+
+
+# Keep old task for backward compatibility
+@celery.task(name="tasks.ocr_task", bind=True, max_retries=3)
+def ocr_task(self, file_path, pdf_password, ocr_output_path, callback_data):
+    """
+    Legacy OCR task - tanpa database (untuk backward compatibility)
+    """
+    # Just call the new task without database updates
+    # This is kept for any existing code that might still use it
+    return ocr_task_with_db(
+        self,
+        document_id=None,
+        ocr_id=None,
+        file_path=file_path,
+        pdf_password=pdf_password,
+        ocr_output_path=ocr_output_path,
+        callback_data=callback_data
+    )
 
 
 def send_callback(letter_id, extracted_text, download_url, has_protection=False, total_pages=0):
@@ -169,7 +287,7 @@ def send_callback(letter_id, extracted_text, download_url, has_protection=False,
     CALLBACK_TOKEN = os.getenv("CALLBACK_TOKEN")
 
     if not CALLBACK_URL:
-        print("⚠️  Callback URL tidak diatur di environment - skip callback")
+        print("⚠️  Callback URL tidak diatur - skip callback")
         return False
 
     headers = {
@@ -193,7 +311,7 @@ def send_callback(letter_id, extracted_text, download_url, has_protection=False,
         print(f"✓ Callback berhasil dikirim untuk letter_id: {letter_id}")
         return True
     except Exception as e:
-        print(f"✗ Callback gagal untuk letter_id {letter_id}: {str(e)}")
+        print(f"✗ Callback gagal: {str(e)}")
         return False
 
 
